@@ -4,11 +4,58 @@ const express = require('express');
 const axios = require('axios');
 const OpenAI = require('openai');
 
+const { Pool } = require('pg');
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production'
+    ? { rejectUnauthorized: false }
+    : false,
+});
+
 const app = express();
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
+
+// ✅ ADD THIS RIGHT HERE
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS dashboard_snapshots (
+      id SERIAL PRIMARY KEY,
+      company_id TEXT,
+      total_ap NUMERIC,
+      overdue_ap NUMERIC,
+      total_ar NUMERIC,
+      cash_balance NUMERIC,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+}
+
+// ✅ ADD THIS RIGHT HERE (directly under initDB)
+
+async function saveSnapshot(data) {
+  try {
+    await pool.query(
+      `INSERT INTO dashboard_snapshots
+      (company_id, total_ap, overdue_ap, total_ar, cash_balance)
+      VALUES ($1, $2, $3, $4, $5)`,
+      [
+        data.companyId || 'default',
+        data.totalAP || 0,
+        data.overdueAP || 0,
+        data.totalAR || 0,
+        data.cash || 0,
+      ]
+    );
+
+    console.log('Snapshot saved to database');
+  } catch (err) {
+    console.error('Error saving snapshot:', err.message);
+  }
+}
 
 // ======================================================
 // ENV / QUICKBOOKS SETUP
@@ -1623,6 +1670,16 @@ const rawBills = await getBillsFromQuickBooks(forceRefresh);
     );
 
     const currentSnapshot = buildHistoricalSnapshot(unpaidBills, kpis, actionCounts);
+
+// ✅ ADD THIS LINE
+await saveSnapshot({
+  companyId: 'client-1',
+  totalAP: kpis.totalUnpaid,
+  overdueAP: kpis.overdueAmount,
+  totalAR: 0, // (you’re not calculating AR yet, so leave 0)
+  cash: services.bankData?.metrics?.availableCash || 0,
+});
+
 recordDashboardSnapshot(currentSnapshot);
 
 const previousSnapshot = getPreviousSnapshot();
@@ -2087,6 +2144,7 @@ const rawBills = await getBillsFromQuickBooks(forceRefresh);
 app.get('/test', (req, res) => {
   res.send('Server works');
 });
-app.listen(PORT, () => {
-  console.log(`Open http://localhost:${PORT}`);
+app.listen(PORT, async () => {
+  console.log(`Server running on port ${PORT}`);
+  await initDB();
 });
