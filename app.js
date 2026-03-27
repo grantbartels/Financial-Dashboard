@@ -2619,9 +2619,9 @@ app.get('/api/blueprint/readiness', async (req, res) => {
     const dashboardData = buildDashboardData(rawBills, services);
 
     res.json({
-      ok: true,
-      ...buildReadinessChecklist(services, dashboardData),
-    });
+  ok: true,
+  readiness: buildReadinessChecklist(services, dashboardData),
+});
   } catch (err) {
     res.status(500).json({
       ok: false,
@@ -2851,5 +2851,30 @@ function summarizeBillsByCategory(processedBills = [], categories = []) {
 }
 
 function summarizeBillsByJob(processedBills = []) {
-  const m = new Map();
- 
+  const jobMap = new Map();
+
+  for (const bill of processedBills) {
+    const jobTag = extractJobTag(bill) || 'Unassigned';
+
+    if (!jobMap.has(jobTag)) {
+      jobMap.set(jobTag, {
+        jobTag,
+        billCount: 0,
+        totalBillBalance: 0,
+        categories: new Set(),
+      });
+    }
+
+    const current = jobMap.get(jobTag);
+    current.billCount += 1;
+    current.totalBillBalance = round2(current.totalBillBalance + Number(bill.balance || 0));
+    current.categories.add(bill.vendorCategory || 'General');
+  }
+
+  return [...jobMap.values()]
+    .map((item) => ({
+      ...item,
+      categories: [...item.categories],
+    }))
+    .sort((a, b) => b.totalBillBalance - a.totalBillBalance);
+}
