@@ -1,28 +1,10 @@
 require('dotenv').config();
-
+console.log('OpenAI key loaded:', !!process.env.OPENAI_API_KEY);
 const express = require('express');
 const axios = require('axios');
-const crypto = require('crypto');
+const OpenAI = require('openai');
+
 const { Pool } = require('pg');
-
-const app = express();
-app.use(express.json());
-
-const PORT = Number(process.env.PORT || 3000);
-const COMPANY_ID = process.env.COMPANY_ID || 'client-1';
-
-const QB_CLIENT_ID = process.env.QB_CLIENT_ID || '';
-const QB_CLIENT_SECRET = process.env.QB_CLIENT_SECRET || '';
-const QB_REDIRECT_URI = process.env.QB_REDIRECT_URI || `http://localhost:${PORT}/callback`;
-const QB_ENV = process.env.QB_ENV || 'sandbox';
-const QB_OAUTH_STATE = process.env.QB_OAUTH_STATE || 'final-core-blueprint-state';
-
-const QB_BASE_URL =
-  QB_ENV === 'production'
-    ? 'https://quickbooks.api.intuit.com'
-    : 'https://sandbox-quickbooks.api.intuit.com';
-
-const CACHE_TTL_MS = 60 * 1000;
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -31,22 +13,87 @@ const pool = new Pool({
     : false,
 });
 
+const app = express();
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+// ✅ ADD THIS RIGHT HERE
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS dashboard_snapshots (
+      id SERIAL PRIMARY KEY,
+      company_id TEXT,
+      total_ap NUMERIC,
+      overdue_ap NUMERIC,
+      total_ar NUMERIC,
+      cash_balance NUMERIC,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+}
+
+// ✅ ADD THIS RIGHT HERE (directly under initDB)
+
+async function saveSnapshot(data) {
+  try {
+    await pool.query(
+      `INSERT INTO dashboard_snapshots
+      (company_id, total_ap, overdue_ap, total_ar, cash_balance)
+      VALUES ($1, $2, $3, $4, $5)`,
+      [
+        data.companyId || 'default',
+        data.totalAP || 0,
+        data.overdueAP || 0,
+        data.totalAR || 0,
+        data.cash || 0,
+      ]
+    );
+
+    console.log('Snapshot saved to database');
+  } catch (err) {
+    console.error('Error saving snapshot:', err.message);
+  }
+}
+
+// ======================================================
+// ENV / QUICKBOOKS SETUP
+// ======================================================
+
+const PORT = Number(process.env.PORT || 3000);
+const CLIENT_ID = process.env.QB_CLIENT_ID || '';
+const CLIENT_SECRET = process.env.QB_CLIENT_SECRET || '';
+const REDIRECT_URI = process.env.QB_REDIRECT_URI || `http://localhost:${PORT}/callback`;
+const QB_ENV = process.env.QB_ENV || 'sandbox';
+
+const QB_BASE_URL =
+  QB_ENV === 'production'
+    ? 'https://quickbooks.api.intuit.com'
+    : 'https://sandbox-quickbooks.api.intuit.com';
+
 let accessToken = '';
-let refreshToken = '';
 let realmId = '';
-let tokenExpiresAt = null;
-let refreshExpiresAt = null;
 let lastSyncTime = null;
 let syncStatus = 'Not synced';
 
-const cache = {
-  bills: { data: null, fetchedAt: 0 },
-  invoices: { data: null, fetchedAt: 0 },
-  accounts: { data: null, fetchedAt: 0 },
-  customers: { data: null, fetchedAt: 0 },
-  billPayments: { data: null, fetchedAt: 0 },
-  reports: { pnl: null, bs: null, fetchedAt: 0 },
+let billsCache = {
+  data: null,
+  fetchedAt: null,
 };
+
+const CACHE_TTL_MS = 60 * 1000; // 60 seconds
+
+let dashboardHistory = [];
+const HISTORY_LIMIT = 50;
+
+if (!CLIENT_ID || !CLIENT_SECRET) {
+  console.warn('Missing QB_CLIENT_ID or QB_CLIENT_SECRET in environment variables.');
+}
+
+// ======================================================
+// CONFIG
+// ======================================================
 
 const CONFIG = {
   thresholds: {
@@ -57,14 +104,14 @@ const CONFIG = {
     overdueCriticalDays: 30,
     mediumBillAmount: 1000,
     largeBillAmount: 2500,
-    highInvoiceAmount: 5000,
     concentrationMediumPct: 20,
     concentrationHighPct: 35,
+    paymentHistoryLookbackLimit: 300,
+    anomalyAmountVariancePct: 40,
+    lowCashCoveragePct: 100,
+    mediumCashCoveragePct: 150,
     healthyCurrentRatio: 1.5,
     weakCurrentRatio: 1.0,
-    healthyCashCoveragePct: 150,
-    weakCashCoveragePct: 100,
-    abnormalAmountVariancePct: 40,
   },
   weights: {
     overdueBase: 60,
@@ -96,6 +143,15 @@ const CONFIG = {
     reviewMin: 20,
     monitorMin: 10,
   },
+  vendorCategories: {
+    utilities: ['electric', 'power', 'water', 'utility', 'utilities', 'gas', 'internet', 'wifi', 'telecom'],
+    rentLease: ['rent', 'lease', 'landlord', 'property'],
+    insurance: ['insurance'],
+    payrollRelated: ['payroll', 'adp', 'paychex', 'gusto', 'wages', 'salary'],
+    inventoryMaterials: ['supply', 'supplies', 'inventory', 'materials', 'wholesale', 'lumber', 'parts'],
+    maintenanceRepair: ['repair', 'repairs', 'maintenance', 'service', 'bodyshop', 'contractor'],
+    discretionary: ['marketing', 'advertising', 'promo', 'software', 'subscription', 'saas'],
+  },
   criticalVendorCategories: new Set([
     'Utilities',
     'Rent / Lease',
@@ -103,41 +159,193 @@ const CONFIG = {
     'Payroll Related',
     'Inventory / Materials',
   ]),
+  reasonPriority: {
+    urgency: {
+      'Cash cannot fully cover': 110,
+      'Cash coverage is tight': 105,
+      'Critical vendor category': 100,
+      Overdue: 95,
+      'Due today': 90,
+      'Due in': 85,
+      'Due within 7 days': 80,
+      'Due within 14 days': 70,
+      'Large bill': 65,
+      'Medium bill': 55,
+      'Abnormal payment timing': 60,
+      'Weak financial health context': 58,
+    },
+    anomaly: {
+      'Possible duplicate detected': 100,
+      Duplicate: 95,
+      'Same vendor + amount + bill date appears multiple times': 90,
+      'Amount is unusually high vs vendor history': 85,
+    },
+    data: {
+      'Missing due date': 90,
+      'Missing invoice number': 50,
+      'Missing terms': 40,
+      'Missing memo': 10,
+    },
+  },
 };
 
-const INDUSTRY_TEMPLATES = {
-  general: {
-    label: 'General SMB',
-    focus: ['AP', 'AR', 'Cash', 'Financial Health', 'Controls'],
-    extraMetrics: [],
-    intakeFields: ['locations', 'employeeCount', 'usesInventory', 'usesProjects', 'collectsDeposits'],
-    nextBuildSuggestions: ['cash flow forecasting', 'custom rules', 'owner reporting'],
-  },
-  trade_install: {
-    label: 'Trade / Install',
-    focus: ['AP', 'AR', 'Cash', 'Financial Health', 'Controls', 'Materials', 'Job Billing'],
-    extraMetrics: ['inventoryCogsMismatch', 'materialsExposure'],
-    intakeFields: ['usesProjects', 'collectsDeposits', 'usesSubcontractors', 'tracksJobCosting'],
-    nextBuildSuggestions: ['job costing', 'WIP', 'deposits', 'crew profitability'],
-  },
-  retail: {
-    label: 'Retail',
-    focus: ['AP', 'AR', 'Cash', 'Financial Health', 'Controls', 'Inventory'],
-    extraMetrics: ['inventoryCogsMismatch'],
-    intakeFields: ['usesInventory', 'locationCount', 'tracksClassesOrLocations'],
-    nextBuildSuggestions: ['SKU profitability', 'inventory turns', 'reorder logic'],
-  },
-  professional_services: {
-    label: 'Professional Services',
-    focus: ['AR', 'Cash', 'Collections', 'Financial Health', 'Controls'],
-    extraMetrics: [],
-    intakeFields: ['billingModel', 'employeeCount', 'tracksTime', 'retainerModel'],
-    nextBuildSuggestions: ['utilization', 'billable hours', 'staff margin'],
-  },
-};
+// ======================================================
+// GENERIC HELPERS
+// ======================================================
+
+function getTodayOnly() {
+  const now = new Date();
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate());
+}
 
 function round2(num) {
   return Math.round((Number(num || 0) + Number.EPSILON) * 100) / 100;
+}
+
+function escapeHtml(value) {
+  if (value === null || value === undefined) return '';
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function formatMoney(value, currency = 'USD') {
+  const num = Number(value || 0);
+  try {
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency,
+    }).format(num);
+  } catch {
+    return `$${num.toFixed(2)}`;
+  }
+}
+
+function csvEscape(value) {
+  if (value === null || value === undefined) return '""';
+  const str = String(value).replace(/"/g, '""');
+  return `"${str}"`;
+}
+
+function safeText(value, fallback = 'N/A') {
+  if (value === null || value === undefined) return fallback;
+  const str = String(value).trim();
+  return str ? str : fallback;
+}
+
+function isMissingText(value) {
+  return value === null || value === undefined || String(value).trim() === '' || String(value).trim() === 'N/A';
+}
+
+function formatBoolean(value) {
+  return value ? 'Yes' : 'No';
+}
+
+function getDaysUntilDue(dueDate) {
+  if (!dueDate) return null;
+  const due = new Date(`${dueDate}T00:00:00`);
+  if (Number.isNaN(due.getTime())) return null;
+  const diffMs = due - getTodayOnly();
+  return Math.ceil(diffMs / (1000 * 60 * 60 * 24));
+}
+
+function getAgingBucket(daysUntilDue) {
+  if (daysUntilDue === null) return 'No Due Date';
+  if (daysUntilDue < 0) return 'Overdue';
+  if (daysUntilDue === 0) return 'Due Today';
+  if (daysUntilDue <= 3) return 'Due in 1–3 Days';
+  if (daysUntilDue <= 7) return 'Due in 4–7 Days';
+  if (daysUntilDue <= 14) return 'Due in 8–14 Days';
+  return 'Due Later';
+}
+
+function getAmountBucket(amount) {
+  if (amount >= CONFIG.thresholds.largeBillAmount) return 'Large';
+  if (amount >= CONFIG.thresholds.mediumBillAmount) return 'Medium';
+  return 'Small';
+}
+
+function getPaymentStatus(balance, totalAmount) {
+  if (balance <= 0) return 'Paid';
+  if (balance < totalAmount) return 'Partially Paid';
+  return 'Unpaid';
+}
+
+function normalizeText(value) {
+  return String(value || '').toLowerCase().trim();
+}
+
+function containsAny(text, terms) {
+  return terms.some((term) => text.includes(term));
+}
+
+function classifyVendorFromContext({ vendorName = '', account = '', categorySummary = '', memo = '' }) {
+  const categories = CONFIG.vendorCategories;
+  const vendorText = normalizeText(vendorName);
+  const accountText = normalizeText(account);
+  const categoryText = normalizeText(categorySummary);
+  const memoText = normalizeText(memo);
+  const financialText = `${accountText} ${categoryText}`.trim();
+  const allText = `${financialText} ${vendorText} ${memoText}`.trim();
+
+  if (containsAny(financialText, categories.utilities) || containsAny(allText, ['pg&e'])) return 'Utilities';
+  if (containsAny(financialText, categories.rentLease)) return 'Rent / Lease';
+  if (containsAny(financialText, categories.insurance) || containsAny(allText, categories.insurance)) return 'Insurance';
+  if (containsAny(financialText, categories.payrollRelated) || containsAny(allText, categories.payrollRelated)) return 'Payroll Related';
+  if (containsAny(financialText, categories.inventoryMaterials) || containsAny(allText, categories.inventoryMaterials)) return 'Inventory / Materials';
+  if (containsAny(financialText, categories.maintenanceRepair) || containsAny(allText, categories.maintenanceRepair)) return 'Maintenance / Repair';
+  if (containsAny(financialText, categories.discretionary) || containsAny(allText, categories.discretionary)) return 'Discretionary';
+  return 'General';
+}
+
+function isCriticalVendorCategory(category) {
+  return CONFIG.criticalVendorCategories.has(category);
+}
+
+function scoreReason(label, group) {
+  const priorities = CONFIG.reasonPriority[group] || {};
+  for (const prefix of Object.keys(priorities)) {
+    if (label.startsWith(prefix)) return priorities[prefix];
+  }
+  return 0;
+}
+
+function buildDecisionReason(urgencyDrivers, anomalyFlags, dataQualityFlags) {
+  const ranked = [];
+
+  urgencyDrivers.forEach((label) => ranked.push({ label, score: scoreReason(label, 'urgency') }));
+  anomalyFlags.forEach((label) => ranked.push({ label, score: scoreReason(label, 'anomaly') }));
+  dataQualityFlags.forEach((label) => ranked.push({ label, score: scoreReason(label, 'data') }));
+
+  const seen = new Set();
+  const top = ranked
+    .sort((a, b) => b.score - a.score)
+    .filter((item) => {
+      if (seen.has(item.label)) return false;
+      seen.add(item.label);
+      return true;
+    })
+    .slice(0, 2)
+    .map((item) => item.label);
+
+  return top.length ? top.join(' + ') : 'No immediate concern';
+}
+
+function average(values) {
+  if (!values.length) return null;
+  return round2(values.reduce((sum, value) => sum + Number(value || 0), 0) / values.length);
+}
+
+function median(values) {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 0) {
+    return round2((sorted[mid - 1] + sorted[mid]) / 2);
+  }
+  return round2(sorted[mid]);
 }
 
 function safeDivide(a, b) {
@@ -145,623 +353,539 @@ function safeDivide(a, b) {
   return round2(a / b);
 }
 
-function normalizeText(value, fallback = 'N/A') {
-  if (value === null || value === undefined) return fallback;
-  const str = String(value).trim();
-  return str || fallback;
-}
-
-function lower(value) {
-  return String(value || '').trim().toLowerCase();
-}
-
-function parseDate(value) {
-  if (!value) return null;
-  const d = new Date(value);
+function toDateOnly(dateLike) {
+  if (!dateLike) return null;
+  const d = new Date(dateLike);
   if (Number.isNaN(d.getTime())) return null;
-  return d;
-}
-
-function dateOnlyString(value) {
-  const d = parseDate(value);
-  return d ? d.toISOString().slice(0, 10) : null;
-}
-
-function todayDateOnly() {
-  const d = new Date();
   return new Date(d.getFullYear(), d.getMonth(), d.getDate());
 }
 
-function daysBetweenDates(start, end) {
-  const s = parseDate(start);
-  const e = parseDate(end);
+function daysBetween(start, end) {
+  const s = toDateOnly(start);
+  const e = toDateOnly(end);
   if (!s || !e) return null;
-  const s0 = new Date(s.getFullYear(), s.getMonth(), s.getDate());
-  const e0 = new Date(e.getFullYear(), e.getMonth(), e.getDate());
-  return Math.round((e0 - s0) / 86400000);
+  const diffMs = e - s;
+  return Math.round(diffMs / (1000 * 60 * 60 * 24));
 }
 
-function getDaysUntilDue(dueDate) {
-  if (!dueDate) return null;
-  const d = parseDate(dueDate);
-  if (!d) return null;
-  const due = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-  return Math.round((due - todayDateOnly()) / 86400000);
-}
+// ======================================================
+// QUICKBOOKS HELPERS
+// ======================================================
 
-function agingBucket(daysUntilDue) {
-  if (daysUntilDue === null) return 'No Due Date';
-  if (daysUntilDue < 0) return 'Overdue';
-  if (daysUntilDue === 0) return 'Due Today';
-  if (daysUntilDue <= 3) return 'Due 1-3 Days';
-  if (daysUntilDue <= 7) return 'Due 4-7 Days';
-  if (daysUntilDue <= 14) return 'Due 8-14 Days';
-  return 'Due Later';
-}
-
-function average(values) {
-  if (!values.length) return null;
-  return round2(values.reduce((a, b) => a + Number(b || 0), 0) / values.length);
-}
-
-function median(values) {
-  if (!values.length) return null;
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  if (sorted.length % 2 === 0) return round2((sorted[mid - 1] + sorted[mid]) / 2);
-  return round2(sorted[mid]);
-}
-
-function isCacheFresh(name) {
-  return cache[name] && cache[name].data && (Date.now() - cache[name].fetchedAt < CACHE_TTL_MS);
-}
-
-function isReportCacheFresh() {
-  return cache.reports.fetchedAt && (Date.now() - cache.reports.fetchedAt < CACHE_TTL_MS);
-}
-
-async function initDB() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS qb_connections (
-      company_id TEXT PRIMARY KEY,
-      realm_id TEXT NOT NULL,
-      access_token TEXT NOT NULL,
-      refresh_token TEXT NOT NULL,
-      token_expires_at TIMESTAMP,
-      refresh_expires_at TIMESTAMP,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-  `);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS blueprint_snapshots (
-      id SERIAL PRIMARY KEY,
-      company_id TEXT NOT NULL,
-      snapshot_hash TEXT NOT NULL,
-      total_ap NUMERIC DEFAULT 0,
-      overdue_ap NUMERIC DEFAULT 0,
-      total_ar NUMERIC DEFAULT 0,
-      overdue_ar NUMERIC DEFAULT 0,
-      available_cash NUMERIC DEFAULT 0,
-      current_ratio NUMERIC,
-      readiness_score NUMERIC,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-  `);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS company_intake_profiles (
-      company_id TEXT PRIMARY KEY,
-      industry TEXT DEFAULT 'general',
-      payload JSONB NOT NULL,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-  `);
-}
-
-async function saveConnection() {
-  await pool.query(
-    `INSERT INTO qb_connections
-      (company_id, realm_id, access_token, refresh_token, token_expires_at, refresh_expires_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)
-     ON CONFLICT (company_id)
-     DO UPDATE SET
-       realm_id = EXCLUDED.realm_id,
-       access_token = EXCLUDED.access_token,
-       refresh_token = EXCLUDED.refresh_token,
-       token_expires_at = EXCLUDED.token_expires_at,
-       refresh_expires_at = EXCLUDED.refresh_expires_at,
-       updated_at = CURRENT_TIMESTAMP`,
-    [COMPANY_ID, realmId, accessToken, refreshToken, tokenExpiresAt, refreshExpiresAt]
-  );
-}
-
-async function loadConnection() {
-  const result = await pool.query(
-    `SELECT * FROM qb_connections WHERE company_id = $1 LIMIT 1`,
-    [COMPANY_ID]
-  );
-
-  const row = result.rows[0];
-  if (!row) return null;
-
-  realmId = row.realm_id;
-  accessToken = row.access_token;
-  refreshToken = row.refresh_token;
-  tokenExpiresAt = row.token_expires_at;
-  refreshExpiresAt = row.refresh_expires_at;
-
-  return row;
-}
-
-async function saveIntakeProfile({ companyId = COMPANY_ID, industry = 'general', payload = {} }) {
-  await pool.query(
-    `INSERT INTO company_intake_profiles (company_id, industry, payload, updated_at)
-     VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
-     ON CONFLICT (company_id)
-     DO UPDATE SET industry = EXCLUDED.industry, payload = EXCLUDED.payload, updated_at = CURRENT_TIMESTAMP`,
-    [companyId, industry, JSON.stringify(payload)]
-  );
-}
-
-async function loadIntakeProfile(companyId = COMPANY_ID) {
-  const result = await pool.query(
-    `SELECT company_id, industry, payload, updated_at
-     FROM company_intake_profiles
-     WHERE company_id = $1
-     LIMIT 1`,
-    [companyId]
-  );
-  return result.rows[0] || null;
-}
-
-async function saveSnapshotIfChanged(payload) {
-  const compact = {
-    totalAP: round2(payload.payables.totalAP || 0),
-    overdueAP: round2(payload.payables.overdueAP || 0),
-    totalAR: round2(payload.receivables.totalAR || 0),
-    overdueAR: round2(payload.receivables.overdueAR || 0),
-    availableCash: round2(payload.liquidity.availableCash || 0),
-    currentRatio: payload.financialHealth.currentRatio,
-    readinessScore: payload.readiness.score,
-  };
-
-  const snapshotHash = crypto
-    .createHash('sha256')
-    .update(JSON.stringify(compact))
-    .digest('hex');
-
-  const existing = await pool.query(
-    `SELECT id
-     FROM blueprint_snapshots
-     WHERE company_id = $1 AND snapshot_hash = $2
-     ORDER BY created_at DESC
-     LIMIT 1`,
-    [COMPANY_ID, snapshotHash]
-  );
-
-  if (existing.rowCount > 0) return false;
-
-  await pool.query(
-    `INSERT INTO blueprint_snapshots
-      (company_id, snapshot_hash, total_ap, overdue_ap, total_ar, overdue_ar, available_cash, current_ratio, readiness_score)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-    [
-      COMPANY_ID,
-      snapshotHash,
-      compact.totalAP,
-      compact.overdueAP,
-      compact.totalAR,
-      compact.overdueAR,
-      compact.availableCash,
-      compact.currentRatio,
-      compact.readinessScore,
-    ]
-  );
-
-  return true;
-}
-
-async function getSnapshotHistory(limit = 12) {
-  const result = await pool.query(
-    `SELECT company_id, total_ap, overdue_ap, total_ar, overdue_ar, available_cash, current_ratio, readiness_score, created_at
-     FROM blueprint_snapshots
-     WHERE company_id = $1
-     ORDER BY created_at DESC
-     LIMIT $2`,
-    [COMPANY_ID, limit]
-  );
-
-  return result.rows;
-}
-
-async function refreshQuickBooksAccessToken() {
-  if (!refreshToken) throw new Error('QuickBooks refresh token missing');
-
-  const response = await axios.post(
-    'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer',
-    `grant_type=refresh_token&refresh_token=${encodeURIComponent(refreshToken)}`,
-    {
-      headers: {
-        Authorization: 'Basic ' + Buffer.from(`${QB_CLIENT_ID}:${QB_CLIENT_SECRET}`).toString('base64'),
-        'Content-Type': 'application/x-www-form-urlencoded',
-        Accept: 'application/json',
-      },
-    }
-  );
-
-  accessToken = response.data.access_token;
-  refreshToken = response.data.refresh_token || refreshToken;
-  tokenExpiresAt = response.data.expires_in ? new Date(Date.now() + response.data.expires_in * 1000) : null;
-  refreshExpiresAt = response.data.x_refresh_token_expires_in ? new Date(Date.now() + response.data.x_refresh_token_expires_in * 1000) : refreshExpiresAt;
-
-  await saveConnection();
-  return accessToken;
-}
-
-async function qbGet(path, params = {}, attempt = 0) {
-  if (!accessToken || !realmId) throw new Error('QuickBooks not connected');
-
-  try {
-    return await axios.get(`${QB_BASE_URL}${path}`, {
-      params,
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        Accept: 'application/json',
-      },
-    });
-  } catch (err) {
-    if (err.response?.status === 401 && attempt === 0 && refreshToken) {
-      await refreshQuickBooksAccessToken();
-      return qbGet(path, params, attempt + 1);
-    }
-    throw err;
+async function qbGet(path, params = {}) {
+  if (!accessToken || !realmId) {
+    throw new Error('QuickBooks not connected');
   }
+
+  return axios.get(`${QB_BASE_URL}${path}`, {
+    params,
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: 'application/json',
+    },
+  });
 }
 
 async function qbQuery(sql) {
   return qbGet(`/v3/company/${realmId}/query`, { query: sql });
 }
 
-async function getCachedList(name, sql, responseKey) {
-  if (isCacheFresh(name)) return cache[name].data;
+function isBillsCacheFresh() {
+  if (!billsCache.data || !billsCache.fetchedAt) return false;
+  return Date.now() - billsCache.fetchedAt < CACHE_TTL_MS;
+}
 
-  const response = await qbQuery(sql);
-  const data = response.data.QueryResponse?.[responseKey] || [];
+function clearBillsCache() {
+  billsCache = {
+    data: null,
+    fetchedAt: null,
+  };
+}
 
-  cache[name] = {
-    data,
+async function getBillsFromQuickBooks(forceRefresh = false) {
+  if (!forceRefresh && isBillsCacheFresh()) {
+    return billsCache.data;
+  }
+
+  const response = await qbQuery('SELECT * FROM Bill MAXRESULTS 1000');
+  const rawBills = response.data.QueryResponse?.Bill || [];
+  const normalizedBills = normalizeQuickBooksBills(rawBills);
+
+  billsCache = {
+    data: normalizedBills,
     fetchedAt: Date.now(),
   };
 
-  return data;
+  return normalizedBills;
 }
 
-async function getBills(forceRefresh = false) {
-  if (forceRefresh) cache.bills = { data: null, fetchedAt: 0 };
-  return getCachedList('bills', 'SELECT * FROM Bill MAXRESULTS 1000', 'Bill');
-}
-
-async function getInvoices(forceRefresh = false) {
-  if (forceRefresh) cache.invoices = { data: null, fetchedAt: 0 };
-  return getCachedList('invoices', 'SELECT * FROM Invoice MAXRESULTS 1000', 'Invoice');
-}
-
-async function getAccounts(forceRefresh = false) {
-  if (forceRefresh) cache.accounts = { data: null, fetchedAt: 0 };
-  return getCachedList('accounts', 'SELECT * FROM Account MAXRESULTS 1000', 'Account');
-}
-
-async function getCustomers(forceRefresh = false) {
-  if (forceRefresh) cache.customers = { data: null, fetchedAt: 0 };
-  return getCachedList('customers', 'SELECT * FROM Customer MAXRESULTS 1000', 'Customer');
-}
-
-async function getBillPayments(forceRefresh = false) {
-  if (forceRefresh) cache.billPayments = { data: null, fetchedAt: 0 };
-  return getCachedList('billPayments', 'SELECT * FROM BillPayment MAXRESULTS 500', 'BillPayment');
-}
-
-async function getReports(forceRefresh = false) {
-  if (!forceRefresh && isReportCacheFresh()) {
-    return { pnl: cache.reports.pnl, bs: cache.reports.bs };
+async function getBillPaymentsFromQuickBooks() {
+  try {
+    const response = await qbQuery(`SELECT * FROM BillPayment MAXRESULTS ${CONFIG.thresholds.paymentHistoryLookbackLimit}`);
+    return response.data.QueryResponse?.BillPayment || [];
+  } catch {
+    return [];
   }
+}
 
-  const [pnlRes, bsRes] = await Promise.all([
-    qbGet(`/v3/company/${realmId}/reports/ProfitAndLoss`, {
+async function getAccountsFromQuickBooks() {
+  try {
+    const response = await qbQuery('SELECT * FROM Account MAXRESULTS 1000');
+    return response.data.QueryResponse?.Account || [];
+  } catch {
+    return [];
+  }
+}
+
+async function getProfitAndLossReport() {
+  try {
+    const response = await qbGet(`/v3/company/${realmId}/reports/ProfitAndLoss`, {
       accounting_method: 'Accrual',
       summarize_column_by: 'Total',
-    }).catch(() => ({ data: null })),
-    qbGet(`/v3/company/${realmId}/reports/BalanceSheet`, {
+    });
+    return response.data || null;
+  } catch {
+    return null;
+  }
+}
+
+async function getBalanceSheetReport() {
+  try {
+    const response = await qbGet(`/v3/company/${realmId}/reports/BalanceSheet`, {
       accounting_method: 'Accrual',
       summarize_column_by: 'Total',
-    }).catch(() => ({ data: null })),
-  ]);
-
-  cache.reports = {
-    pnl: pnlRes.data || null,
-    bs: bsRes.data || null,
-    fetchedAt: Date.now(),
-  };
-
-  return { pnl: cache.reports.pnl, bs: cache.reports.bs };
-}
-
-function flattenReportRows(rows = [], out = []) {
-  for (const row of rows) {
-    if (row?.Summary?.ColData?.length) out.push(row);
-    if (row?.Rows?.Row?.length) flattenReportRows(row.Rows.Row, out);
+    });
+    return response.data || null;
+  } catch {
+    return null;
   }
-  return out;
 }
 
-function findReportValue(report, labels) {
-  if (!report?.Rows?.Row) return null;
+// ======================================================
+// STEP 5: PAYMENT BEHAVIOR LAYER
+// ======================================================
 
-  const rows = flattenReportRows(report.Rows.Row, []);
-  const targets = labels.map(lower);
+function extractLinkedBillIdsFromPayment(payment) {
+  const ids = new Set();
+  const lines = Array.isArray(payment.Line) ? payment.Line : [];
 
-  for (const row of rows) {
-    const label = lower(row?.Summary?.ColData?.[0]?.value || '');
-    if (!label) continue;
-
-    if (targets.some((t) => label.includes(t))) {
-      const cell = row.Summary.ColData.find((c, idx) => idx > 0 && c?.value !== undefined);
-      const value = Number(String(cell?.value || '').replace(/,/g, ''));
-      if (Number.isFinite(value)) return value;
+  for (const line of lines) {
+    const linked = Array.isArray(line.LinkedTxn) ? line.LinkedTxn : [];
+    for (const txn of linked) {
+      if (txn.TxnType === 'Bill' && txn.TxnId) ids.add(String(txn.TxnId));
     }
   }
 
-  return null;
+  return [...ids];
 }
 
-function classifyVendorCategory({ vendorName = '', accountName = '', categorySummary = '', memo = '' }) {
-  const text = `${lower(vendorName)} ${lower(accountName)} ${lower(categorySummary)} ${lower(memo)}`;
-
-  if (/(electric|power|water|utility|gas|internet|wifi|telecom)/.test(text)) return 'Utilities';
-  if (/(rent|lease|landlord|property)/.test(text)) return 'Rent / Lease';
-  if (/(insurance)/.test(text)) return 'Insurance';
-  if (/(payroll|adp|paychex|gusto|wages|salary)/.test(text)) return 'Payroll Related';
-  if (/(supply|supplies|inventory|materials|wholesale|parts|glass|hardware|aluminum|lumber)/.test(text)) return 'Inventory / Materials';
-  if (/(repair|repairs|maintenance|service|contractor)/.test(text)) return 'Maintenance / Repair';
-  if (/(marketing|advertising|promo|software|subscription|saas)/.test(text)) return 'Discretionary';
-
-  return 'General';
-}
-
-function getLineCategorySummary(lines = []) {
-  if (!Array.isArray(lines) || !lines.length) return 'N/A';
-
-  const values = lines.map((line) => {
-    return line?.AccountBasedExpenseLineDetail?.AccountRef?.name
-      || line?.ItemBasedExpenseLineDetail?.ItemRef?.name
-      || line?.Description
-      || null;
-  }).filter(Boolean);
-
-  return values.length ? [...new Set(values)].join(', ') : 'N/A';
-}
-
-function getPrimaryAccountName(lines = []) {
-  if (!Array.isArray(lines)) return 'N/A';
-
-  for (const line of lines) {
-    const name = line?.AccountBasedExpenseLineDetail?.AccountRef?.name;
-    if (name) return name;
+function buildPaymentHistoryMetrics(rawBills, billPayments) {
+  if (!Array.isArray(billPayments) || billPayments.length === 0) {
+    return {
+      available: false,
+      reason: 'No BillPayment history was returned from QuickBooks.',
+      metrics: null,
+      vendorStats: {},
+      billPaymentMap: {},
+    };
   }
 
-  return 'N/A';
-}
+  const billById = new Map(rawBills.map((bill) => [String(bill.Id), bill]));
+  const vendorStatsMap = new Map();
+  const billPaymentMap = new Map();
+  const allDaysToPay = [];
+  let lateCount = 0;
+  let analyzedPayments = 0;
 
-function normalizeBill(raw) {
-  const vendorName = normalizeText(raw?.VendorRef?.name, 'Unknown Vendor');
-  const accountName = normalizeText(getPrimaryAccountName(raw?.Line), 'N/A');
-  const categorySummary = normalizeText(getLineCategorySummary(raw?.Line), 'N/A');
-  const memo = normalizeText(raw?.PrivateNote || raw?.Memo, '');
-  const originalAmount = round2(raw?.TotalAmt || 0);
-  const balance = round2(raw?.Balance || 0);
-  const amountPaid = round2(Math.max(0, originalAmount - balance));
-  const dueDate = dateOnlyString(raw?.DueDate);
-  const billDate = dateOnlyString(raw?.TxnDate);
-  const terms = normalizeText(raw?.SalesTermRef?.name || raw?.TermsRef?.name, 'N/A');
-  const billNo = normalizeText(raw?.DocNumber, 'N/A');
-  const daysUntilDue = getDaysUntilDue(dueDate);
-
-  return {
-    billId: normalizeText(raw?.Id, 'N/A'),
-    vendorName,
-    billNo,
-    billDate,
-    dueDate,
-    accountName,
-    categorySummary,
-    memo,
-    originalAmount,
-    balance,
-    amountPaid,
-    terms,
-    daysUntilDue,
-    isOverdue: daysUntilDue !== null && daysUntilDue < 0,
-    agingBucket: agingBucket(daysUntilDue),
-    vendorCategory: classifyVendorCategory({ vendorName, accountName, categorySummary, memo }),
-  };
-}
-
-function normalizeInvoice(raw) {
-  const customerName = normalizeText(raw?.CustomerRef?.name, 'Unknown Customer');
-  const totalAmount = round2(raw?.TotalAmt || 0);
-  const balance = round2(raw?.Balance || 0);
-  const dueDate = dateOnlyString(raw?.DueDate);
-  const invoiceDate = dateOnlyString(raw?.TxnDate);
-  const daysUntilDue = getDaysUntilDue(dueDate);
-
-  return {
-    invoiceId: normalizeText(raw?.Id, 'N/A'),
-    invoiceNo: normalizeText(raw?.DocNumber, 'N/A'),
-    customerName,
-    invoiceDate,
-    dueDate,
-    totalAmount,
-    balance,
-    daysUntilDue,
-    isOverdue: daysUntilDue !== null && daysUntilDue < 0,
-    agingBucket: agingBucket(daysUntilDue),
-  };
-}
-
-function buildPayablesKpis(openBills) {
-  const totalAP = round2(openBills.reduce((sum, b) => sum + Number(b.balance || 0), 0));
-  const overdueBills = openBills.filter((b) => b.isOverdue);
-  const overdueAP = round2(overdueBills.reduce((sum, b) => sum + Number(b.balance || 0), 0));
-
-  const vendorTotals = {};
-  for (const bill of openBills) {
-    vendorTotals[bill.vendorName] = round2((vendorTotals[bill.vendorName] || 0) + Number(bill.balance || 0));
-  }
-
-  const sortedVendorTotals = Object.entries(vendorTotals)
-    .map(([vendor, amount]) => ({ vendor, amount, pctOfAP: totalAP ? round2((amount / totalAP) * 100) : 0 }))
-    .sort((a, b) => b.amount - a.amount);
-
-  const topVendorPct = sortedVendorTotals[0]?.pctOfAP || 0;
-  const vendorConcentrationRisk =
-    topVendorPct >= CONFIG.thresholds.concentrationHighPct ? 'High'
-      : topVendorPct >= CONFIG.thresholds.concentrationMediumPct ? 'Medium'
-        : 'Low';
-
-  return {
-    totalAP,
-    overdueAP,
-    openBillCount: openBills.length,
-    overdueBillCount: overdueBills.length,
-    vendorConcentrationRisk,
-    topVendors: sortedVendorTotals.slice(0, 10),
-  };
-}
-
-function buildReceivablesKpis(openInvoices) {
-  const totalAR = round2(openInvoices.reduce((sum, i) => sum + Number(i.balance || 0), 0));
-  const overdueInvoices = openInvoices.filter((i) => i.isOverdue);
-  const overdueAR = round2(overdueInvoices.reduce((sum, i) => sum + Number(i.balance || 0), 0));
-
-  const customerTotals = {};
-  for (const invoice of openInvoices) {
-    customerTotals[invoice.customerName] = round2((customerTotals[invoice.customerName] || 0) + Number(invoice.balance || 0));
-  }
-
-  const topCustomers = Object.entries(customerTotals)
-    .map(([customer, amount]) => ({ customer, amount, pctOfAR: totalAR ? round2((amount / totalAR) * 100) : 0 }))
-    .sort((a, b) => b.amount - a.amount)
-    .slice(0, 10);
-
-  return {
-    totalAR,
-    overdueAR,
-    openInvoiceCount: openInvoices.length,
-    overdueInvoiceCount: overdueInvoices.length,
-    topCustomers,
-  };
-}
-
-function buildLiquidity(rawAccounts, payablesKpis) {
-  const accounts = Array.isArray(rawAccounts) ? rawAccounts : [];
-  const bankTypes = new Set(['Bank', 'Other Current Asset']);
-  const bankAccounts = accounts.filter((a) => bankTypes.has(a?.AccountType));
-  const availableCash = round2(bankAccounts.reduce((sum, a) => sum + Number(a?.CurrentBalance || 0), 0));
-  const cashCoveragePct = payablesKpis.totalAP ? round2((availableCash / payablesKpis.totalAP) * 100) : null;
-
-  return {
-    availableCash,
-    cashCoveragePct,
-    bankAccountCount: bankAccounts.length,
-  };
-}
-
-function buildFinancialHealth(reports) {
-  const pnl = reports?.pnl || null;
-  const bs = reports?.bs || null;
-
-  const totalIncome = findReportValue(pnl, ['total income', 'income']);
-  const grossProfit = findReportValue(pnl, ['gross profit']);
-  const netIncome = findReportValue(pnl, ['net income']);
-  const currentAssets = findReportValue(bs, ['total current assets']);
-  const currentLiabilities = findReportValue(bs, ['total current liabilities']);
-  const totalAssets = findReportValue(bs, ['total assets']);
-  const totalLiabilities = findReportValue(bs, ['total liabilities']);
-
-  return {
-    totalIncome,
-    grossProfit,
-    netIncome,
-    grossMarginPct: totalIncome ? round2((grossProfit / totalIncome) * 100) : null,
-    netMarginPct: totalIncome ? round2((netIncome / totalIncome) * 100) : null,
-    currentAssets,
-    currentLiabilities,
-    currentRatio: safeDivide(currentAssets, currentLiabilities),
-    totalAssets,
-    totalLiabilities,
-  };
-}
-
-function buildPaymentBehavior(rawBills, rawBillPayments) {
-  const bills = Array.isArray(rawBills) ? rawBills : [];
-  const billPayments = Array.isArray(rawBillPayments) ? rawBillPayments : [];
-
-  const paymentMap = new Map();
   for (const payment of billPayments) {
-    const lines = payment?.Line || [];
-    for (const line of lines) {
-      const linked = line?.LinkedTxn || [];
-      for (const txn of linked) {
-        if (txn?.TxnType === 'Bill' && txn?.TxnId) {
-          if (!paymentMap.has(txn.TxnId)) paymentMap.set(txn.TxnId, []);
-          paymentMap.get(txn.TxnId).push(payment?.TxnDate || null);
-        }
+    const paymentDate = payment.TxnDate || payment.MetaData?.CreateTime;
+    const linkedBillIds = extractLinkedBillIdsFromPayment(payment);
+
+    for (const billId of linkedBillIds) {
+      const bill = billById.get(String(billId));
+      if (!bill) continue;
+
+      const vendorName = safeText(bill.VendorRef?.name, 'Unknown Vendor');
+      const daysToPay = daysBetween(bill.TxnDate, paymentDate);
+      const daysLate = bill.DueDate ? daysBetween(bill.DueDate, paymentDate) : null;
+      const wasLate = daysLate !== null ? daysLate > 0 : false;
+      if (daysToPay === null) continue;
+
+      analyzedPayments += 1;
+      allDaysToPay.push(daysToPay);
+      if (wasLate) lateCount += 1;
+
+      if (!vendorStatsMap.has(vendorName)) {
+        vendorStatsMap.set(vendorName, {
+          vendorName,
+          paymentCount: 0,
+          totalDaysToPay: 0,
+          daysToPayValues: [],
+          latePaymentCount: 0,
+          avgDaysLateWhenLateValues: [],
+        });
       }
+
+      const vendorStat = vendorStatsMap.get(vendorName);
+      vendorStat.paymentCount += 1;
+      vendorStat.totalDaysToPay += daysToPay;
+      vendorStat.daysToPayValues.push(daysToPay);
+      if (wasLate) {
+        vendorStat.latePaymentCount += 1;
+        vendorStat.avgDaysLateWhenLateValues.push(daysLate);
+      }
+
+      billPaymentMap.set(String(billId), {
+        paymentDate,
+        daysToPay,
+        daysLate,
+        wasLate,
+      });
     }
   }
 
   const vendorStats = {};
-  for (const rawBill of bills) {
-    const vendorName = normalizeText(rawBill?.VendorRef?.name, 'Unknown Vendor');
-    const billId = normalizeText(rawBill?.Id, 'N/A');
-    const billDate = rawBill?.TxnDate || null;
-    const paidDates = paymentMap.get(billId) || [];
-    if (!paidDates.length || !billDate) continue;
-
-    const firstPaidDate = paidDates[0];
-    const daysToPay = daysBetweenDates(billDate, firstPaidDate);
-    if (daysToPay === null) continue;
-
-    if (!vendorStats[vendorName]) vendorStats[vendorName] = { paymentDays: [] };
-    vendorStats[vendorName].paymentDays.push(daysToPay);
+  for (const [vendorName, stat] of vendorStatsMap.entries()) {
+    vendorStats[vendorName] = {
+      vendorName,
+      paymentCount: stat.paymentCount,
+      averageDaysToPay: average(stat.daysToPayValues),
+      medianDaysToPay: median(stat.daysToPayValues),
+      latePaymentRate: stat.paymentCount ? round2((stat.latePaymentCount / stat.paymentCount) * 100) : 0,
+      averageDaysLateWhenLate: average(stat.avgDaysLateWhenLateValues) || 0,
+    };
   }
 
-  Object.keys(vendorStats).forEach((vendor) => {
-    const paymentDays = vendorStats[vendor].paymentDays;
-    vendorStats[vendor] = {
-      averageDaysToPay: average(paymentDays),
-      medianDaysToPay: median(paymentDays),
-      sampleSize: paymentDays.length,
-    };
-  });
-
   return {
-    available: true,
-    metrics: {
+    available: analyzedPayments > 0,
+    reason: analyzedPayments > 0 ? null : 'BillPayment records did not map cleanly to bills.',
+    metrics: analyzedPayments > 0 ? {
+      averageDaysToPay: average(allDaysToPay),
+      latePaymentRate: round2((lateCount / analyzedPayments) * 100),
+      analyzedPayments,
       vendorsTracked: Object.keys(vendorStats).length,
-    },
+    } : null,
     vendorStats,
+    billPaymentMap: Object.fromEntries(billPaymentMap.entries()),
   };
 }
 
-function detectBillDuplicates(openBills) {
+// ======================================================
+// STEP 6: FINANCIAL HEALTH LAYER
+// ======================================================
+
+function flattenReportRows(rows = [], collector = []) {
+  for (const row of rows) {
+    if (row.Summary?.ColData?.length) {
+      collector.push(row);
+    }
+    if (row.Rows?.Row?.length) {
+      flattenReportRows(row.Rows.Row, collector);
+    }
+  }
+  return collector;
+}
+
+function findReportValueByLabels(report, labelOptions) {
+  if (!report?.Rows?.Row) return null;
+  const rows = flattenReportRows(report.Rows.Row, []);
+
+  for (const row of rows) {
+    const label = normalizeText(row.Summary?.ColData?.[0]?.value || '');
+    if (!label) continue;
+    for (const option of labelOptions) {
+      if (label.includes(normalizeText(option))) {
+        const numericCell = row.Summary?.ColData?.find((cell, idx) => idx > 0 && cell?.value !== undefined);
+        const value = Number(String(numericCell?.value || '').replace(/,/g, ''));
+        if (Number.isFinite(value)) return value;
+      }
+    }
+  }
+  return null;
+}
+
+async function getStatementsService() {
+  const [pnl, balanceSheet] = await Promise.all([
+    getProfitAndLossReport(),
+    getBalanceSheetReport(),
+  ]);
+
+  if (!pnl && !balanceSheet) {
+    return {
+      available: false,
+      reason: 'P&L / Balance Sheet / Cash Flow integration could not be read from QuickBooks reports.',
+      metrics: null,
+    };
+  }
+
+  const currentAssets = findReportValueByLabels(balanceSheet, ['total current assets']);
+  const currentLiabilities = findReportValueByLabels(balanceSheet, ['total current liabilities']);
+  const totalAssets = findReportValueByLabels(balanceSheet, ['total assets']);
+  const totalLiabilities = findReportValueByLabels(balanceSheet, ['total liabilities']);
+  const netIncome = findReportValueByLabels(pnl, ['net income']);
+  const income = findReportValueByLabels(pnl, ['total income', 'income']);
+  const expenses = findReportValueByLabels(pnl, ['total expenses', 'expenses']);
+
+  const workingCapital =
+    currentAssets !== null && currentLiabilities !== null ? round2(currentAssets - currentLiabilities) : null;
+  const currentRatio =
+    currentAssets !== null && currentLiabilities !== null && currentLiabilities !== 0
+      ? round2(currentAssets / currentLiabilities)
+      : null;
+
+  let financialHealthLabel = 'Unknown';
+  if (currentRatio !== null) {
+    if (currentRatio < CONFIG.thresholds.weakCurrentRatio) financialHealthLabel = 'Weak';
+    else if (currentRatio >= CONFIG.thresholds.healthyCurrentRatio) financialHealthLabel = 'Healthy';
+    else financialHealthLabel = 'Moderate';
+  }
+
+  return {
+    available: true,
+    reason: null,
+    metrics: {
+      currentAssets,
+      currentLiabilities,
+      workingCapital,
+      currentRatio,
+      totalAssets,
+      totalLiabilities,
+      netIncome,
+      totalIncome: income,
+      totalExpenses: expenses,
+      financialHealthLabel,
+    },
+  };
+}
+
+// ======================================================
+// STEP 7: LIQUIDITY / CASH LAYER
+// ======================================================
+
+async function getBankCashService() {
+  const accounts = await getAccountsFromQuickBooks();
+  if (!accounts.length) {
+    return {
+      available: false,
+      reason: 'Bank-feed / cash integration could not read bank accounts from QuickBooks.',
+      metrics: null,
+    };
+  }
+
+  const bankAccounts = accounts.filter((account) => ['Bank', 'Other Current Asset'].includes(account.AccountType));
+  const availableCash = round2(
+    bankAccounts.reduce((sum, account) => sum + Number(account.CurrentBalance || account.CurrentBalanceWithSubAccounts || 0), 0)
+  );
+
+  return {
+    available: bankAccounts.length > 0,
+    reason: bankAccounts.length > 0 ? null : 'No bank / cash accounts were returned from QuickBooks.',
+    metrics: {
+      bankAccountCount: bankAccounts.length,
+      availableCash,
+      bankAccounts: bankAccounts.map((account) => ({
+        name: account.Name,
+        balance: round2(Number(account.CurrentBalance || account.CurrentBalanceWithSubAccounts || 0)),
+      })),
+    },
+  };
+}
+
+function augmentBankCashMetrics(bankData, unpaidBills) {
+  if (!bankData.available || !bankData.metrics) return bankData;
+
+  const payNowBills = unpaidBills.filter((bill) => bill.recommendedAction === 'Pay Now');
+  const paySoonBills = unpaidBills.filter((bill) => bill.recommendedAction === 'Pay Soon');
+  const payNowAmount = round2(payNowBills.reduce((sum, bill) => sum + bill.balance, 0));
+  const paySoonAmount = round2(paySoonBills.reduce((sum, bill) => sum + bill.balance, 0));
+  const availableCash = Number(bankData.metrics.availableCash || 0);
+  const cashCoveragePayNow = payNowAmount > 0 ? round2((availableCash / payNowAmount) * 100) : null;
+  const cashCoveragePayNowSoon = (payNowAmount + paySoonAmount) > 0
+    ? round2((availableCash / (payNowAmount + paySoonAmount)) * 100)
+    : null;
+
+  return {
+    ...bankData,
+    metrics: {
+      ...bankData.metrics,
+      payNowAmount,
+      paySoonAmount,
+      cashCoveragePayNow,
+      cashCoveragePayNowSoon,
+    },
+  };
+}
+
+// ======================================================
+// BILL EXTRACTION
+// ======================================================
+
+function getCategorySummary(lines = []) {
+  if (!Array.isArray(lines) || lines.length === 0) return 'N/A';
+
+  const categories = lines
+    .map((line) => {
+      if (line.AccountBasedExpenseLineDetail?.AccountRef?.name) {
+        return line.AccountBasedExpenseLineDetail.AccountRef.name;
+      }
+      if (line.ItemBasedExpenseLineDetail?.ItemRef?.name) {
+        return line.ItemBasedExpenseLineDetail.ItemRef.name;
+      }
+      if (line.Description) {
+        return line.Description;
+      }
+      return null;
+    })
+    .filter(Boolean);
+
+  return categories.length ? [...new Set(categories)].join(', ') : 'N/A';
+}
+
+function getPrimaryAccount(lines = []) {
+  if (!Array.isArray(lines)) return 'N/A';
+  for (const line of lines) {
+    const name = line.AccountBasedExpenseLineDetail?.AccountRef?.name;
+    if (name) return name;
+  }
+  return 'N/A';
+}
+
+function getLocationClass(bill) {
+  return safeText(bill.DepartmentRef?.name || bill.ClassRef?.name);
+}
+
+function getMemo(bill) {
+  return safeText(bill.PrivateNote || bill.Memo);
+}
+
+function getTerms(bill) {
+  return safeText(bill.SalesTermRef?.name || bill.TermRef?.name);
+}
+
+// ✅ PASTE HERE
+// ======================================================
+// DATA NORMALIZATION LAYER
+// ======================================================
+
+function normalizeVendorName(name) {
+  if (!name) return 'Unknown Vendor';
+
+  return String(name)
+    .trim()
+    .replace(/\s+/g, ' ')
+    .replace(/\bincorporated\b/gi, 'INC')
+    .replace(/\binc\.\b/gi, 'INC')
+    .replace(/\bllc\b/gi, 'LLC')
+    .replace(/\bltd\.\b/gi, 'LTD');
+}
+
+function normalizeDateString(value) {
+  if (!value) return null;
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString().slice(0, 10);
+}
+
+function normalizeNumber(value, fallback = 0) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : fallback;
+}
+
+function normalizeQuickBooksBill(bill) {
+  return {
+    ...bill,
+    TxnDate: normalizeDateString(bill.TxnDate),
+    DueDate: normalizeDateString(bill.DueDate),
+    TotalAmt: normalizeNumber(bill.TotalAmt, 0),
+    Balance: normalizeNumber(bill.Balance, 0),
+    VendorRef: {
+      ...bill.VendorRef,
+      name: normalizeVendorName(bill.VendorRef?.name),
+    },
+  };
+}
+
+function normalizeQuickBooksBills(rawBills = []) {
+  return rawBills.map(normalizeQuickBooksBill);
+}
+
+// ======================================================
+
+function buildBaseProcessedBills(rawBills) {
+  return rawBills.map((bill) => {
+    const billId = safeText(bill.Id);
+    const billNo = safeText(bill.DocNumber);
+    const vendorId = safeText(bill.VendorRef?.value);
+    const vendorName = safeText(bill.VendorRef?.name, 'Unknown Vendor');
+    const billDate = safeText(bill.TxnDate);
+    const dueDate = bill.DueDate || null;
+    const createdAt = safeText(bill.MetaData?.CreateTime);
+    const lastUpdated = safeText(bill.MetaData?.LastUpdatedTime);
+
+    const originalAmount = Number(bill.TotalAmt || 0);
+    const balance = Number(bill.Balance || 0);
+    const amountPaid = Math.max(0, round2(originalAmount - balance));
+    const currency = safeText(bill.CurrencyRef?.value, 'USD');
+    const terms = getTerms(bill);
+    const memo = getMemo(bill);
+    const categorySummary = getCategorySummary(bill.Line);
+    const account = getPrimaryAccount(bill.Line);
+    const locationClass = getLocationClass(bill);
+    const daysUntilDue = getDaysUntilDue(dueDate);
+    const isOverdue = daysUntilDue !== null && daysUntilDue < 0;
+    const agingBucket = getAgingBucket(daysUntilDue);
+    const amountBucket = getAmountBucket(originalAmount);
+    const vendorCategory = classifyVendorFromContext({
+      vendorName,
+      account,
+      categorySummary,
+      memo,
+    });
+    const isCriticalVendor = isCriticalVendorCategory(vendorCategory);
+
+    return {
+      billId,
+      billNo,
+      vendorId,
+      vendorName,
+      vendorCategory,
+      isCriticalVendor,
+      billDate,
+      dueDate,
+      createdAt,
+      lastUpdated,
+      originalAmount,
+      balance,
+      amountPaid,
+      currency,
+      paymentStatus: getPaymentStatus(balance, originalAmount),
+      terms,
+      memo,
+      categorySummary,
+      account,
+      locationClass,
+      daysUntilDue,
+      isOverdue,
+      agingBucket,
+      amountBucket,
+      dueIn3Days: daysUntilDue !== null && daysUntilDue >= 0 && daysUntilDue <= CONFIG.thresholds.dueSoonDays,
+      dueIn7Days: daysUntilDue !== null && daysUntilDue >= 0 && daysUntilDue <= CONFIG.thresholds.dueWeekDays,
+      dueIn14Days: daysUntilDue !== null && daysUntilDue >= 0 && daysUntilDue <= CONFIG.thresholds.due14Days,
+    };
+  });
+}
+
+// ======================================================
+// DUPLICATE DETECTION
+// ======================================================
+
+function detectCurrentDuplicates(processedBills) {
   const duplicateMap = new Map();
   const byBillNo = new Map();
   const byVendorAmountDate = new Map();
 
-  for (const bill of openBills) {
-    if (bill.billNo && bill.billNo !== 'N/A') {
+  for (const bill of processedBills) {
+    if (!isMissingText(bill.billNo)) {
       const billNoKey = `${bill.vendorName}__${bill.billNo}`;
       if (!byBillNo.has(billNoKey)) byBillNo.set(billNoKey, []);
       byBillNo.get(billNoKey).push(bill.billId);
@@ -793,9 +917,13 @@ function detectBillDuplicates(openBills) {
   return duplicateMap;
 }
 
-function buildVendorAmountBenchmarks(openBills) {
+// ======================================================
+// STEP 8: ANOMALY / CONTROL LAYER
+// ======================================================
+
+function buildVendorAmountBenchmarks(processedBills) {
   const map = new Map();
-  for (const bill of openBills) {
+  for (const bill of processedBills) {
     if (!map.has(bill.vendorName)) map.set(bill.vendorName, []);
     map.get(bill.vendorName).push(Number(bill.originalAmount || 0));
   }
@@ -811,48 +939,38 @@ function buildVendorAmountBenchmarks(openBills) {
   return benchmarks;
 }
 
-function buildControls(openBills, openInvoices, financialHealth) {
-  const duplicateMap = detectBillDuplicates(openBills);
-  const vendorBenchmarks = buildVendorAmountBenchmarks(openBills);
-
-  const missingBillNoCount = openBills.filter((b) => b.billNo === 'N/A').length;
-  const missingDueDateCount = openBills.filter((b) => !b.dueDate).length;
-  const missingInvoiceNoCount = openInvoices.filter((i) => i.invoiceNo === 'N/A').length;
-  const negativeCurrentRatio = financialHealth.currentRatio !== null && financialHealth.currentRatio < 1;
-
-  return {
-    duplicateBillCount: duplicateMap.size,
-    missingBillNoCount,
-    missingDueDateCount,
-    missingInvoiceNoCount,
-    negativeCurrentRatio,
-    duplicateMap,
-    vendorBenchmarks,
-  };
-}
-
-function getBillDecisionReason(urgencyDrivers, anomalyFlags, dataQualityFlags) {
-  const merged = [...urgencyDrivers, ...anomalyFlags, ...dataQualityFlags];
-  return merged.length ? merged.slice(0, 2).join(' + ') : 'No immediate concern';
-}
+// ======================================================
+// RULE ENGINE
+// ======================================================
 
 function applyRulesToBill(bill, context) {
-  const { duplicateWarnings = [], paymentBehavior = null, financialHealth = null, liquidity = null, vendorBenchmarks = {} } = context || {};
+  const {
+    duplicateWarnings = [],
+    paymentHistory = null,
+    statementData = null,
+    bankData = null,
+    vendorBenchmarks = {},
+  } = context || {};
 
   const urgencyDrivers = [];
   const dataQualityFlags = [];
   const anomalyFlags = [];
+  const ruleHits = [];
   let score = 0;
 
   const addScore = (points, label, group = 'urgency') => {
     score += points;
+    ruleHits.push({ label, points, group });
     if (group === 'urgency') urgencyDrivers.push(label);
     if (group === 'data') dataQualityFlags.push(label);
     if (group === 'anomaly') anomalyFlags.push(label);
   };
 
   if (bill.isOverdue) {
-    const extraDays = Math.min(Math.abs(bill.daysUntilDue) * CONFIG.weights.overduePerDay, CONFIG.weights.overdueMaxExtra);
+    const extraDays = Math.min(
+      Math.abs(bill.daysUntilDue) * CONFIG.weights.overduePerDay,
+      CONFIG.weights.overdueMaxExtra
+    );
     addScore(CONFIG.weights.overdueBase + extraDays, `Overdue by ${Math.abs(bill.daysUntilDue)} day(s)`);
   } else if (bill.daysUntilDue === 0) {
     addScore(CONFIG.weights.dueToday, 'Due today');
@@ -864,388 +982,603 @@ function applyRulesToBill(bill, context) {
     addScore(CONFIG.weights.dueSoon14, 'Due within 14 days');
   }
 
-  if (bill.originalAmount >= CONFIG.thresholds.largeBillAmount) addScore(CONFIG.weights.largeAmount, 'Large bill');
-  else if (bill.originalAmount >= CONFIG.thresholds.mediumBillAmount) addScore(CONFIG.weights.mediumAmount, 'Medium bill');
+  if (bill.originalAmount >= CONFIG.thresholds.largeBillAmount) {
+    addScore(CONFIG.weights.largeAmount, 'Large bill');
+  } else if (bill.originalAmount >= CONFIG.thresholds.mediumBillAmount) {
+    addScore(CONFIG.weights.mediumAmount, 'Medium bill');
+  }
 
-  if (CONFIG.criticalVendorCategories.has(bill.vendorCategory)) {
-    addScore(CONFIG.weights.criticalVendor, 'Critical vendor category');
+  if (bill.isCriticalVendor) {
+    addScore(CONFIG.weights.criticalVendor, `Critical vendor category: ${bill.vendorCategory}`);
+  }
+
+  if (isMissingText(bill.billNo)) {
+    addScore(CONFIG.weights.missingBillNo, 'Missing invoice number', 'data');
+  }
+
+  if (!bill.dueDate) {
+    addScore(CONFIG.weights.missingDueDate, 'Missing due date', 'data');
+  }
+
+  if (isMissingText(bill.memo)) {
+    addScore(CONFIG.weights.missingMemo, 'Missing memo', 'data');
+  }
+
+  if (isMissingText(bill.terms)) {
+    addScore(CONFIG.weights.missingTerms, 'Missing terms', 'data');
   }
 
   if (duplicateWarnings.length) {
     addScore(CONFIG.weights.duplicateSuspected, 'Possible duplicate detected', 'anomaly');
+    duplicateWarnings.forEach((warning) => anomalyFlags.push(warning));
   }
 
-  if (!bill.dueDate) addScore(CONFIG.weights.missingDueDate, 'Missing due date', 'data');
-  if (!bill.billNo || bill.billNo === 'N/A') addScore(CONFIG.weights.missingBillNo, 'Missing invoice number', 'data');
-  if (!bill.terms || bill.terms === 'N/A') addScore(CONFIG.weights.missingTerms, 'Missing terms', 'data');
-  if (!bill.memo) addScore(CONFIG.weights.missingMemo, 'Missing memo', 'data');
+  const vendorBehavior = paymentHistory?.vendorStats?.[bill.vendorName];
+  if (vendorBehavior && bill.daysUntilDue !== null) {
+    const avgDaysToPay = Number(vendorBehavior.averageDaysToPay || 0);
+    if (bill.isOverdue && vendorBehavior.latePaymentRate >= 60) {
+      addScore(CONFIG.weights.lateVendorPattern, `Vendor historically paid late (${vendorBehavior.latePaymentRate}%)`);
+    }
 
-  const vendorBenchmark = vendorBenchmarks[bill.vendorName];
-  if (vendorBenchmark?.medianAmount && vendorBenchmark.sampleSize >= 3) {
-    const variancePct = Math.abs((bill.originalAmount - vendorBenchmark.medianAmount) / vendorBenchmark.medianAmount) * 100;
-    if (variancePct >= CONFIG.thresholds.abnormalAmountVariancePct) {
+    if (avgDaysToPay > 0 && bill.daysUntilDue >= 0 && avgDaysToPay > bill.daysUntilDue + 5) {
+      addScore(CONFIG.weights.abnormalPaymentTiming, `Abnormal payment timing vs vendor history (${avgDaysToPay} avg days to pay)`);
+    }
+  }
+
+  const financialHealth = statementData?.metrics?.financialHealthLabel;
+  if (financialHealth === 'Weak') {
+    addScore(CONFIG.weights.weakFinancials, 'Weak financial health context');
+  } else if (financialHealth === 'Healthy') {
+    addScore(CONFIG.weights.healthyFinancials, 'Healthy financial health context');
+  }
+
+  const availableCash = Number(bankData?.metrics?.availableCash || 0);
+  if (bankData?.available) {
+    if (availableCash > 0 && bill.balance > availableCash) {
+      addScore(CONFIG.weights.lowCashCoverage, 'Cash cannot fully cover this bill');
+    } else if (availableCash > 0) {
+      const coveragePct = round2((availableCash / Math.max(bill.balance, 1)) * 100);
+      if (coveragePct <= CONFIG.thresholds.mediumCashCoveragePct) {
+        addScore(CONFIG.weights.mediumCashCoverage, 'Cash coverage is tight');
+      }
+    }
+  }
+
+  const benchmark = vendorBenchmarks[bill.vendorName];
+  if (benchmark && benchmark.sampleSize >= 2 && benchmark.averageAmount) {
+    const ratio = bill.originalAmount / benchmark.averageAmount;
+    if (ratio >= 1 + CONFIG.thresholds.anomalyAmountVariancePct / 100) {
       addScore(CONFIG.weights.abnormalAmount, 'Amount is unusually high vs vendor history', 'anomaly');
     }
   }
 
-  const vendorPayStats = paymentBehavior?.vendorStats?.[bill.vendorName];
-  if (vendorPayStats?.medianDaysToPay !== null && vendorPayStats?.sampleSize >= 3 && bill.daysUntilDue !== null) {
-    if (bill.daysUntilDue < -7) addScore(CONFIG.weights.abnormalPaymentTiming, 'Abnormal payment timing');
-  }
+  score = Math.min(Math.round(score), 100);
 
-  if (financialHealth?.currentRatio !== null) {
-    if (financialHealth.currentRatio < CONFIG.thresholds.weakCurrentRatio) addScore(CONFIG.weights.weakFinancials, 'Weak financial health context');
-    else if (financialHealth.currentRatio >= CONFIG.thresholds.healthyCurrentRatio) addScore(CONFIG.weights.healthyFinancials, 'Healthy financial health context');
-  }
+  const severeOverdue = bill.isOverdue && Math.abs(bill.daysUntilDue) >= CONFIG.thresholds.overdueHighDays;
+  const criticalOverdue = bill.isOverdue && Math.abs(bill.daysUntilDue) >= CONFIG.thresholds.overdueCriticalDays;
+  const hasReviewIssue = anomalyFlags.length > 0 || dataQualityFlags.includes('Missing due date');
+  const hasNonBlockingDataIssue = dataQualityFlags.length > 0;
 
-  if (liquidity?.cashCoveragePct !== null) {
-    if (liquidity.cashCoveragePct < CONFIG.thresholds.weakCashCoveragePct) addScore(CONFIG.weights.lowCashCoverage, 'Cash cannot fully cover');
-    else if (liquidity.cashCoveragePct < CONFIG.thresholds.healthyCashCoveragePct) addScore(CONFIG.weights.mediumCashCoverage, 'Cash coverage is tight');
-  }
-
-  let action = 'Monitor';
+  let recommendedAction = 'Later';
+  let decisionRank = 5;
   let riskLevel = 'Low';
 
-  if (score >= CONFIG.actionCutoffs.payNowMin) {
-    action = 'Pay Now';
+  if (criticalOverdue || bill.daysUntilDue === 0 || score >= CONFIG.actionCutoffs.payNowMin) {
+    recommendedAction = 'Pay Now';
+    decisionRank = 1;
     riskLevel = 'High';
   } else if (score >= CONFIG.actionCutoffs.paySoonMin) {
-    action = 'Pay Soon';
+    recommendedAction = 'Pay Soon';
+    decisionRank = 2;
+    riskLevel = bill.isCriticalVendor || severeOverdue ? 'High' : 'Medium';
+  } else if (hasReviewIssue || score >= CONFIG.actionCutoffs.reviewMin) {
+    recommendedAction = 'Review';
+    decisionRank = 3;
     riskLevel = 'Medium';
-  } else if (score >= CONFIG.actionCutoffs.reviewMin) {
-    action = 'Review';
-    riskLevel = 'Medium';
+  } else if (hasNonBlockingDataIssue || score >= CONFIG.actionCutoffs.monitorMin) {
+    recommendedAction = 'Monitor';
+    decisionRank = 4;
+    riskLevel = 'Low';
   }
 
+  const decisionReason = buildDecisionReason(urgencyDrivers, anomalyFlags, dataQualityFlags);
+
+  const explanationParts = [];
+  if (urgencyDrivers.length) explanationParts.push(`Urgency drivers: ${urgencyDrivers.join(', ')}`);
+  if (anomalyFlags.length) explanationParts.push(`Anomalies: ${anomalyFlags.join(', ')}`);
+  if (dataQualityFlags.length) explanationParts.push(`Data quality: ${dataQualityFlags.join(', ')}`);
+  if (!explanationParts.length) explanationParts.push('No major urgency, anomaly, or data-quality concern detected');
+
   return {
-    ...bill,
-    priorityScore: round2(score),
-    action,
-    riskLevel,
-    decisionReason: getBillDecisionReason(urgencyDrivers, anomalyFlags, dataQualityFlags),
+    priorityScore: score,
+    ruleHits,
     urgencyDrivers,
     anomalyFlags,
     dataQualityFlags,
-    duplicateWarnings,
+    reviewFlags: [...anomalyFlags, ...dataQualityFlags],
+    recommendedAction,
+    decisionRank,
+    riskLevel,
+    decisionReason,
+    explanationText: `${recommendedAction} because ${explanationParts.join(' | ')}.`,
+    paymentBehaviorSnapshot: vendorBehavior || null,
   };
 }
 
-function buildPayablesPriorities(openBills, liquidity, financialHealth, paymentBehavior, controls) {
-  return openBills
-    .map((bill) => applyRulesToBill(bill, {
-      duplicateWarnings: controls.duplicateMap.get(bill.billId) || [],
-      paymentBehavior,
-      financialHealth,
-      liquidity,
-      vendorBenchmarks: controls.vendorBenchmarks,
+function buildDecisionBills(rawBills, services = {}) {
+  const baseBills = buildBaseProcessedBills(rawBills);
+  const duplicateMap = detectCurrentDuplicates(baseBills);
+  const vendorBenchmarks = buildVendorAmountBenchmarks(baseBills);
+
+  return baseBills.map((bill) => {
+    const output = applyRulesToBill(bill, {
+      duplicateWarnings: duplicateMap.get(bill.billId) || [],
+      paymentHistory: services.paymentData,
+      statementData: services.statementData,
+      bankData: services.bankData,
+      vendorBenchmarks,
+    });
+    return { ...bill, ...output };
+  });
+}
+
+function sortBillsForDecision(bills) {
+  return [...bills].sort((a, b) => {
+    if (a.decisionRank !== b.decisionRank) return a.decisionRank - b.decisionRank;
+    if (b.priorityScore !== a.priorityScore) return b.priorityScore - a.priorityScore;
+
+    const aDays = a.daysUntilDue === null ? 99999 : a.daysUntilDue;
+    const bDays = b.daysUntilDue === null ? 99999 : b.daysUntilDue;
+    if (aDays !== bDays) return aDays - bDays;
+
+    return b.balance - a.balance;
+  });
+}
+
+// ======================================================
+// KPI / ALERTS
+// ======================================================
+
+function buildKpiSummary(unpaidBills) {
+  const totalUnpaid = round2(unpaidBills.reduce((sum, bill) => sum + bill.balance, 0));
+  const overdueBills = unpaidBills.filter((bill) => bill.isOverdue);
+  const overdueAmount = round2(overdueBills.reduce((sum, bill) => sum + bill.balance, 0));
+  const overduePercentOfTotal = totalUnpaid > 0 ? round2((overdueAmount / totalUnpaid) * 100) : 0;
+
+  const dueIn3DaysBills = unpaidBills.filter((bill) => bill.dueIn3Days);
+  const dueIn7DaysBills = unpaidBills.filter((bill) => bill.dueIn7Days);
+  const dueIn14DaysBills = unpaidBills.filter((bill) => bill.dueIn14Days);
+
+  const overdueDays = overdueBills
+    .map((bill) => Math.abs(Number(bill.daysUntilDue)))
+    .filter((days) => Number.isFinite(days));
+
+  const avgDaysOverdue = overdueDays.length
+    ? round2(overdueDays.reduce((sum, days) => sum + days, 0) / overdueDays.length)
+    : 0;
+
+  const largestOverdueBill = overdueBills.length
+    ? overdueBills.reduce((max, bill) => (bill.balance > max.balance ? bill : max), overdueBills[0])
+    : null;
+
+  const vendorTotals = new Map();
+  for (const bill of unpaidBills) {
+    vendorTotals.set(bill.vendorName, round2((vendorTotals.get(bill.vendorName) || 0) + bill.balance));
+  }
+
+  const vendorEntries = [...vendorTotals.entries()]
+    .map(([vendorName, amount]) => ({
+      vendorName,
+      amount,
+      percentOfTotal: totalUnpaid ? round2((amount / totalUnpaid) * 100) : 0,
     }))
-    .sort((a, b) => b.priorityScore - a.priorityScore);
-}
+    .sort((a, b) => b.amount - a.amount);
 
-function buildCollectionsPriorities(openInvoices, receivablesKpis) {
-  return openInvoices
-    .map((invoice) => {
-      let score = 0;
-      if (invoice.isOverdue) score += 50 + Math.min(Math.abs(invoice.daysUntilDue || 0) * 2, 20);
-      else if (invoice.daysUntilDue === 0) score += 35;
-      else if (invoice.daysUntilDue !== null && invoice.daysUntilDue <= 7) score += 15;
-      if (invoice.balance >= CONFIG.thresholds.highInvoiceAmount) score += 20;
-
-      const customerTop = receivablesKpis.topCustomers.find((x) => x.customer === invoice.customerName);
-      if ((customerTop?.pctOfAR || 0) >= CONFIG.thresholds.concentrationHighPct) score += 10;
-
-      const action = score >= 60 ? 'Collect Now' : score >= 30 ? 'Collect Soon' : 'Monitor';
-      return {
-        ...invoice,
-        priorityScore: round2(score),
-        action,
-      };
-    })
-    .sort((a, b) => b.priorityScore - a.priorityScore);
-}
-
-function buildReadiness(financialHealth, controls, liquidity, payablesKpis, receivablesKpis, intakeProfile) {
-  let score = 100;
-  const issues = [];
-
-  if (controls.duplicateBillCount > 0) {
-    score -= 15;
-    issues.push('Duplicate bill signals detected');
+  const topVendor = vendorEntries[0] || null;
+  let vendorConcentrationRisk = 'Low';
+  if (topVendor) {
+    if (topVendor.percentOfTotal >= CONFIG.thresholds.concentrationHighPct) vendorConcentrationRisk = 'High';
+    else if (topVendor.percentOfTotal >= CONFIG.thresholds.concentrationMediumPct) vendorConcentrationRisk = 'Medium';
   }
-  if (controls.missingBillNoCount > 0) {
-    score -= 10;
-    issues.push('Bills missing invoice numbers');
-  }
-  if (controls.missingDueDateCount > 0) {
-    score -= 10;
-    issues.push('Bills missing due dates');
-  }
-  if (controls.missingInvoiceNoCount > 0) {
-    score -= 5;
-    issues.push('Invoices missing document numbers');
-  }
-  if (financialHealth.currentRatio !== null && financialHealth.currentRatio < CONFIG.thresholds.weakCurrentRatio) {
-    score -= 15;
-    issues.push('Weak current ratio');
-  }
-  if (liquidity.cashCoveragePct !== null && liquidity.cashCoveragePct < CONFIG.thresholds.weakCashCoveragePct) {
-    score -= 15;
-    issues.push('Cash does not cover AP comfortably');
-  }
-  if (payablesKpis.vendorConcentrationRisk === 'High') {
-    score -= 10;
-    issues.push('High vendor concentration');
-  }
-  if ((receivablesKpis.overdueAR || 0) > 0 && (receivablesKpis.totalAR || 0) > 0 && ((receivablesKpis.overdueAR / receivablesKpis.totalAR) * 100) > 35) {
-    score -= 10;
-    issues.push('Overdue AR is elevated');
-  }
-  if (!intakeProfile) {
-    score -= 10;
-    issues.push('Business intake profile not completed');
-  }
-
-  score = Math.max(0, round2(score));
-
-  const level = score >= 85 ? 'Ready'
-    : score >= 70 ? 'Usable'
-      : score >= 50 ? 'Needs Cleanup'
-        : 'Needs Intervention';
 
   return {
-    score,
-    level,
-    issues,
+    totalUnpaid,
+    overdueBillsCount: overdueBills.length,
+    overdueAmount,
+    overduePercentOfTotal,
+    dueIn3DaysCount: dueIn3DaysBills.length,
+    dueIn3DaysAmount: round2(dueIn3DaysBills.reduce((sum, bill) => sum + bill.balance, 0)),
+    dueIn7DaysCount: dueIn7DaysBills.length,
+    dueIn7DaysAmount: round2(dueIn7DaysBills.reduce((sum, bill) => sum + bill.balance, 0)),
+    dueIn14DaysCount: dueIn14DaysBills.length,
+    dueIn14DaysAmount: round2(dueIn14DaysBills.reduce((sum, bill) => sum + bill.balance, 0)),
+    averageDaysOverdue: avgDaysOverdue,
+    largestOverdueBill,
+    topVendor,
+    vendorConcentrationRisk,
   };
 }
 
-function buildAlerts(payablesKpis, receivablesKpis, liquidity, financialHealth, controls) {
+function buildHistoricalSnapshot(unpaidBills, kpis, actionCounts) {
+  return {
+    capturedAt: new Date().toISOString(),
+    unpaidBillsCount: unpaidBills.length,
+    totalUnpaid: kpis.totalUnpaid,
+    overdueBillsCount: kpis.overdueBillsCount,
+    overdueAmount: kpis.overdueAmount,
+    overduePercentOfTotal: kpis.overduePercentOfTotal,
+    dueIn3DaysCount: kpis.dueIn3DaysCount,
+    dueIn7DaysCount: kpis.dueIn7DaysCount,
+    dueIn14DaysCount: kpis.dueIn14DaysCount,
+    averageDaysOverdue: kpis.averageDaysOverdue,
+    vendorConcentrationRisk: kpis.vendorConcentrationRisk,
+    topVendorName: kpis.topVendor?.vendorName || null,
+    topVendorAmount: kpis.topVendor?.amount || 0,
+    payNowCount: actionCounts.payNow,
+    paySoonCount: actionCounts.paySoon,
+    reviewCount: actionCounts.review,
+    monitorCount: actionCounts.monitor,
+    laterCount: actionCounts.later,
+  };
+}
+
+function recordDashboardSnapshot(snapshot) {
+  dashboardHistory.unshift(snapshot);
+
+  if (dashboardHistory.length > HISTORY_LIMIT) {
+    dashboardHistory = dashboardHistory.slice(0, HISTORY_LIMIT);
+  }
+}
+
+function getPreviousSnapshot() {
+  return dashboardHistory.length > 1 ? dashboardHistory[1] : null;
+}
+
+function buildTrend(current, previous) {
+  if (current == null || previous == null) return null;
+
+  const delta = round2(current - previous);
+
+  return {
+    current,
+    previous,
+    delta,
+    direction: delta > 0 ? 'up' : delta < 0 ? 'down' : 'flat',
+  };
+}
+
+function buildHistoricalComparisons(currentSnapshot, previousSnapshot) {
+  if (!currentSnapshot || !previousSnapshot) return null;
+
+  return {
+    totalUnpaid: buildTrend(currentSnapshot.totalUnpaid, previousSnapshot.totalUnpaid),
+    overdueAmount: buildTrend(currentSnapshot.overdueAmount, previousSnapshot.overdueAmount),
+    overdueBillsCount: buildTrend(currentSnapshot.overdueBillsCount, previousSnapshot.overdueBillsCount),
+    payNowCount: buildTrend(currentSnapshot.payNowCount, previousSnapshot.payNowCount),
+    reviewCount: buildTrend(currentSnapshot.reviewCount, previousSnapshot.reviewCount),
+    unpaidBillsCount: buildTrend(currentSnapshot.unpaidBillsCount, previousSnapshot.unpaidBillsCount),
+  };
+}
+
+function renderTrendValue(trend, isMoney = false) {
+  if (!trend) return 'No prior snapshot';
+
+  const deltaText = isMoney
+    ? formatMoney(trend.delta)
+    : String(trend.delta);
+
+  const direction =
+    trend.direction === 'up' ? '↑ Up' :
+    trend.direction === 'down' ? '↓ Down' :
+    '→ Flat';
+
+  return `${direction} (${deltaText})`;
+}
+
+function buildActionCounts(unpaidBills) {
+  return {
+    payNow: unpaidBills.filter((bill) => bill.recommendedAction === 'Pay Now').length,
+    paySoon: unpaidBills.filter((bill) => bill.recommendedAction === 'Pay Soon').length,
+    review: unpaidBills.filter((bill) => bill.recommendedAction === 'Review').length,
+    monitor: unpaidBills.filter((bill) => bill.recommendedAction === 'Monitor').length,
+    later: unpaidBills.filter((bill) => bill.recommendedAction === 'Later').length,
+  };
+}
+
+function buildDataQualityCounts(unpaidBills) {
+  return {
+    missingInvoiceNumber: unpaidBills.filter((b) => b.dataQualityFlags.includes('Missing invoice number')).length,
+    missingDueDate: unpaidBills.filter((b) => b.dataQualityFlags.includes('Missing due date')).length,
+    missingTerms: unpaidBills.filter((b) => b.dataQualityFlags.includes('Missing terms')).length,
+    missingMemo: unpaidBills.filter((b) => b.dataQualityFlags.includes('Missing memo')).length,
+  };
+}
+
+function buildAlerts(unpaidBills, kpis, paymentData, statementData, bankData, dataQualityCounts) {
   const alerts = [];
 
-  if (payablesKpis.overdueAP > 0) alerts.push({ severity: 'high', code: 'OVERDUE_AP', message: 'There are overdue bills requiring attention.' });
-  if (receivablesKpis.overdueAR > 0) alerts.push({ severity: 'medium', code: 'OVERDUE_AR', message: 'There are overdue invoices affecting cash collection.' });
-  if (liquidity.cashCoveragePct !== null && liquidity.cashCoveragePct < CONFIG.thresholds.weakCashCoveragePct) alerts.push({ severity: 'high', code: 'LOW_CASH_COVERAGE', message: 'Cash coverage versus AP is weak.' });
-  if (financialHealth.currentRatio !== null && financialHealth.currentRatio < CONFIG.thresholds.weakCurrentRatio) alerts.push({ severity: 'high', code: 'WEAK_CURRENT_RATIO', message: 'Current ratio is below target.' });
-  if (controls.duplicateBillCount > 0) alerts.push({ severity: 'high', code: 'DUPLICATE_BILLS', message: 'Potential duplicate bills detected.' });
+  if (kpis.overduePercentOfTotal >= 40) {
+    alerts.push({
+      severity: 'High',
+      title: 'High overdue exposure',
+      detail: `${kpis.overduePercentOfTotal}% of unpaid bills are overdue by dollar value.`,
+    });
+  }
+
+  if (kpis.vendorConcentrationRisk === 'High' && kpis.topVendor) {
+    alerts.push({
+      severity: 'High',
+      title: 'High vendor concentration',
+      detail: `${kpis.topVendor.vendorName} represents ${kpis.topVendor.percentOfTotal}% of unpaid exposure.`,
+    });
+  }
+
+  const duplicateCount = unpaidBills.filter((b) => b.anomalyFlags.some((flag) => flag.toLowerCase().includes('duplicate'))).length;
+  if (duplicateCount > 0) {
+    alerts.push({
+      severity: 'Medium',
+      title: 'Possible duplicates detected',
+      detail: `${duplicateCount} unpaid bill(s) have duplicate warnings.`,
+    });
+  }
+
+  const abnormalAmountCount = unpaidBills.filter((b) => b.anomalyFlags.includes('Amount is unusually high vs vendor history')).length;
+  if (abnormalAmountCount > 0) {
+    alerts.push({
+      severity: 'Medium',
+      title: 'Abnormal bill amounts detected',
+      detail: `${abnormalAmountCount} unpaid bill(s) appear unusually high versus vendor history.`,
+    });
+  }
+
+  const dataQualityDetailParts = [];
+  if (dataQualityCounts.missingInvoiceNumber) dataQualityDetailParts.push(`${dataQualityCounts.missingInvoiceNumber} missing invoice number`);
+  if (dataQualityCounts.missingDueDate) dataQualityDetailParts.push(`${dataQualityCounts.missingDueDate} missing due date`);
+  if (dataQualityCounts.missingTerms) dataQualityDetailParts.push(`${dataQualityCounts.missingTerms} missing terms`);
+  if (dataQualityCounts.missingMemo) dataQualityDetailParts.push(`${dataQualityCounts.missingMemo} missing memo`);
+
+  if (dataQualityDetailParts.length) {
+    alerts.push({
+      severity: 'Medium',
+      title: 'Bills need data cleanup',
+      detail: dataQualityDetailParts.join(' • '),
+    });
+  }
+
+  if (paymentData.available && paymentData.metrics) {
+    alerts.push({
+      severity: 'Info',
+      title: 'Payment behavior layer active',
+      detail: `Analyzed ${paymentData.metrics.analyzedPayments} bill payments across ${paymentData.metrics.vendorsTracked} vendors.`,
+    });
+  } else {
+    alerts.push({ severity: 'Info', title: 'Payment history not connected', detail: paymentData.reason });
+  }
+
+  if (statementData.available && statementData.metrics) {
+    alerts.push({
+      severity: statementData.metrics.financialHealthLabel === 'Weak' ? 'Medium' : 'Info',
+      title: 'Financial health layer active',
+      detail: `Current ratio: ${statementData.metrics.currentRatio ?? 'N/A'} | Health: ${statementData.metrics.financialHealthLabel}`,
+    });
+  } else {
+    alerts.push({ severity: 'Info', title: 'Financial statements not connected', detail: statementData.reason });
+  }
+
+  if (bankData.available && bankData.metrics) {
+    const coverage = bankData.metrics.cashCoveragePayNow;
+    let severity = 'Info';
+    if (coverage !== null && coverage < CONFIG.thresholds.lowCashCoveragePct) severity = 'High';
+    else if (coverage !== null && coverage < CONFIG.thresholds.mediumCashCoveragePct) severity = 'Medium';
+
+    alerts.push({
+      severity,
+      title: 'Liquidity layer active',
+      detail: `Available cash: ${formatMoney(bankData.metrics.availableCash)} | Pay Now coverage: ${coverage ?? 'N/A'}%`,
+    });
+  } else {
+    alerts.push({ severity: 'Info', title: 'Bank / cash data not connected', detail: bankData.reason });
+  }
 
   return alerts;
 }
 
-function buildEscalation(readiness, controls, intakeProfile) {
-  if (readiness.score >= 85 && controls.duplicateBillCount === 0) {
-    return { level: 'Remote Ready', reason: 'Data is clean enough for online use with minimal help.' };
-  }
-  if (readiness.score >= 60) {
-    return { level: 'Remote Cleanup', reason: 'Can likely be standardized remotely with guided fixes.' };
-  }
-  if (!intakeProfile) {
-    return { level: 'Intake Required', reason: 'Need intake profile before deciding deeper escalation.' };
-  }
-  return { level: 'Controller Review', reason: 'Books or workflows are materially broken and need deeper intervention.' };
+// ======================================================
+// RENDER HELPERS
+// ======================================================
+
+function renderList(items, fallback = 'None') {
+  if (!Array.isArray(items) || !items.length) return fallback;
+  return items.map((item) => escapeHtml(item)).join('<br>');
 }
 
-function buildHistorySummary(rows = []) {
-  const points = [...rows].reverse().map((row) => ({
-    createdAt: row.created_at,
-    totalAP: round2(row.total_ap),
-    overdueAP: round2(row.overdue_ap),
-    totalAR: round2(row.total_ar),
-    overdueAR: round2(row.overdue_ar),
-    availableCash: round2(row.available_cash),
-    currentRatio: row.current_ratio !== null ? round2(row.current_ratio) : null,
-    readinessScore: row.readiness_score !== null ? round2(row.readiness_score) : null,
-  }));
-
-  if (points.length < 2) return { points, trend: null };
-
-  const first = points[0];
-  const last = points[points.length - 1];
-
-  return {
-    points,
-    trend: {
-      totalAPDelta: round2(last.totalAP - first.totalAP),
-      overdueAPDelta: round2(last.overdueAP - first.overdueAP),
-      totalARDelta: round2(last.totalAR - first.totalAR),
-      overdueARDelta: round2(last.overdueAR - first.overdueAR),
-      cashDelta: round2(last.availableCash - first.availableCash),
-      readinessDelta: round2((last.readinessScore || 0) - (first.readinessScore || 0)),
-    },
-  };
+function renderRuleHits(ruleHits) {
+  if (!Array.isArray(ruleHits) || !ruleHits.length) return 'None';
+  return ruleHits
+    .map((hit) => `${escapeHtml(hit.label)} (+${escapeHtml(String(hit.points))}) [${escapeHtml(hit.group)}]`)
+    .join('<br>');
 }
 
-function buildRemoteIntakeSchema(industry = 'general') {
-  const template = INDUSTRY_TEMPLATES[industry] || INDUSTRY_TEMPLATES.general;
-  return {
-    industry,
-    required: [
-      'companyType',
-      'locationCount',
-      'employeeCount',
-      'usesInventory',
-      'usesProjects',
-      'billingTiming',
-      'collectsDeposits',
-      'payrollSystem',
-      'tracksClassesOrLocations',
-      'biggestPainPoint',
-    ],
-    templateSpecific: template.intakeFields,
-  };
+function renderUnavailableCard(title, reason) {
+  return `
+    <div class="kpi-card unavailable">
+      <strong>${escapeHtml(title)}</strong><br>
+      <span>${escapeHtml(reason)}</span>
+    </div>
+  `;
 }
 
-function applyIndustryOverlay(templateKey, blueprint, intakeProfile) {
-  const template = INDUSTRY_TEMPLATES[templateKey] || INDUSTRY_TEMPLATES.general;
+function renderAlerts(alerts) {
+  if (!alerts.length) return '<p>No alerts.</p>';
+  return alerts.map((alert) => {
+    const cls = alert.severity === 'High'
+      ? 'alert-high'
+      : alert.severity === 'Medium'
+        ? 'alert-medium'
+        : 'alert-info';
 
-  const openMaterialBills = blueprint.payables.priorities.filter((b) => b.vendorCategory === 'Inventory / Materials');
-  const materialsExposure = round2(openMaterialBills.reduce((sum, b) => sum + Number(b.balance || 0), 0));
-  const inventoryCogsMismatch = Boolean(
-    intakeProfile?.payload?.usesInventory &&
-    blueprint.financialHealth.grossMarginPct !== null &&
-    blueprint.financialHealth.grossMarginPct > 80
-  );
-
-  return {
-    industryTemplate: {
-      key: templateKey in INDUSTRY_TEMPLATES ? templateKey : 'general',
-      ...template,
-    },
-    extensionLayer: {
-      materialsExposure,
-      inventoryCogsMismatch,
-      nextBuildSuggestions: template.nextBuildSuggestions,
-    },
-  };
+    return `
+      <div class="alert-card ${cls}">
+        <strong>${escapeHtml(alert.severity)} — ${escapeHtml(alert.title)}</strong><br>
+        <span>${escapeHtml(alert.detail)}</span>
+      </div>
+    `;
+  }).join('');
 }
 
-async function buildFinalCoreBlueprint({ forceRefresh = false, industry = 'general' } = {}) {
-  if (!accessToken || !realmId) throw new Error('QuickBooks not connected');
+function buildDashboardData(rawBills, services) {
+  const decisionBills = buildDecisionBills(rawBills, services);
+  const unpaidBills = sortBillsForDecision(decisionBills.filter((bill) => bill.balance > 0));
+  const kpis = buildKpiSummary(unpaidBills);
+  const actionCounts = buildActionCounts(unpaidBills);
+  const dataQualityCounts = buildDataQualityCounts(unpaidBills);
+  return { unpaidBills, kpis, actionCounts, dataQualityCounts };
+}
 
-  const intakeProfile = await loadIntakeProfile(COMPANY_ID);
-  const selectedIndustry = intakeProfile?.industry || industry || 'general';
-
-  const [rawBills, rawInvoices, rawAccounts, rawCustomers, rawBillPayments, reports] = await Promise.all([
-    getBills(forceRefresh),
-    getInvoices(forceRefresh),
-    getAccounts(forceRefresh),
-    getCustomers(forceRefresh),
-    getBillPayments(forceRefresh),
-    getReports(forceRefresh),
+async function buildAllServices(rawBills) {
+  const [billPayments, statementDataRaw, bankDataRaw] = await Promise.all([
+    getBillPaymentsFromQuickBooks(),
+    getStatementsService(),
+    getBankCashService(),
   ]);
 
-  const bills = rawBills.map(normalizeBill);
-  const invoices = rawInvoices.map(normalizeInvoice);
-
-  const openBills = bills.filter((b) => b.balance > 0);
-  const openInvoices = invoices.filter((i) => i.balance > 0);
-
-  const payablesKpis = buildPayablesKpis(openBills);
-  const receivablesKpis = buildReceivablesKpis(openInvoices);
-  const liquidity = buildLiquidity(rawAccounts, payablesKpis);
-  const financialHealth = buildFinancialHealth(reports);
-  const paymentBehavior = buildPaymentBehavior(rawBills, rawBillPayments);
-  const controls = buildControls(openBills, openInvoices, financialHealth);
-
-  const payablesPriorities = buildPayablesPriorities(openBills, liquidity, financialHealth, paymentBehavior, controls);
-  const collectionsPriorities = buildCollectionsPriorities(openInvoices, receivablesKpis);
-  const readiness = buildReadiness(financialHealth, controls, liquidity, payablesKpis, receivablesKpis, intakeProfile);
-  const alerts = buildAlerts(payablesKpis, receivablesKpis, liquidity, financialHealth, controls);
-  const escalation = buildEscalation(readiness, controls, intakeProfile);
-
-  const blueprint = {
-    meta: {
-      companyId: COMPANY_ID,
-      generatedAt: new Date().toISOString(),
-      industry: selectedIndustry,
-      quickbooksRealmId: realmId,
-    },
-    intake: {
-      available: Boolean(intakeProfile),
-      schema: buildRemoteIntakeSchema(selectedIndustry),
-      profile: intakeProfile ? {
-        industry: intakeProfile.industry,
-        payload: intakeProfile.payload,
-        updatedAt: intakeProfile.updated_at,
-      } : null,
-    },
-    payables: {
-      ...payablesKpis,
-      priorities: payablesPriorities.slice(0, 50),
-    },
-    receivables: {
-      ...receivablesKpis,
-      priorities: collectionsPriorities.slice(0, 50),
-    },
-    liquidity,
-    financialHealth,
-    controls: {
-      duplicateBillCount: controls.duplicateBillCount,
-      missingBillNoCount: controls.missingBillNoCount,
-      missingDueDateCount: controls.missingDueDateCount,
-      missingInvoiceNoCount: controls.missingInvoiceNoCount,
-      negativeCurrentRatio: controls.negativeCurrentRatio,
-    },
-    paymentBehavior: paymentBehavior.metrics
-      ? paymentBehavior
-      : {
-          available: paymentBehavior.available,
-          metrics: null,
-          vendorStats: {},
-        },
-    readiness,
-    alerts,
-    escalation,
-    history: { points: [], trend: null },
-    recommendedActions: {
-      payNow: payablesPriorities.filter((x) => x.action === 'Pay Now').slice(0, 10),
-      paySoon: payablesPriorities.filter((x) => x.action === 'Pay Soon').slice(0, 10),
-      reviewNow: [
-        ...payablesPriorities.filter((x) => x.action === 'Review').slice(0, 5).map((x) => ({ type: 'bill', ...x })),
-        ...collectionsPriorities.filter((x) => x.action !== 'Monitor').slice(0, 5).map((x) => ({ type: 'invoice', ...x })),
-      ].slice(0, 10),
-    },
+  const paymentData = buildPaymentHistoryMetrics(rawBills, billPayments);
+  const initialServices = {
+    paymentData,
+    statementData: statementDataRaw,
+    bankData: bankDataRaw,
   };
 
-  const overlay = applyIndustryOverlay(selectedIndustry, blueprint, intakeProfile);
-  const finalPayload = {
-    ...blueprint,
-    overlay,
+  const firstPass = buildDashboardData(rawBills, initialServices);
+  const bankData = augmentBankCashMetrics(bankDataRaw, firstPass.unpaidBills);
+
+  return {
+    paymentData,
+    statementData: statementDataRaw,
+    bankData,
   };
-
-  await saveSnapshotIfChanged(finalPayload);
-  const historyRows = await getSnapshotHistory(12);
-  finalPayload.history = buildHistorySummary(historyRows);
-
-  lastSyncTime = new Date();
-  syncStatus = 'Success';
-
-  return finalPayload;
 }
 
+// ======================================================
+// AI SUMMARY LAYER
+// ======================================================
+
+async function generateAiSummary({ unpaidBills, kpis, actionCounts, alerts, services }) {
+  try {
+    if (!process.env.OPENAI_API_KEY) {
+      return 'AI summary unavailable: OPENAI_API_KEY missing.';
+    }
+
+    const topBills = unpaidBills.slice(0, 5).map((bill) => ({
+      vendor: bill.vendorName,
+      category: bill.vendorCategory,
+      balance: bill.balance,
+      action: bill.recommendedAction,
+      risk: bill.riskLevel,
+      score: bill.priorityScore,
+      reason: bill.decisionReason,
+      dueDate: bill.dueDate,
+      daysUntilDue: bill.daysUntilDue,
+      overdue: bill.isOverdue,
+    }));
+
+    const payload = {
+      summary: {
+        unpaidBills: unpaidBills.length,
+        totalUnpaid: kpis.totalUnpaid,
+        overdueBills: kpis.overdueBillsCount,
+        overdueAmount: kpis.overdueAmount,
+        overduePercent: kpis.overduePercentOfTotal,
+        due3: kpis.dueIn3DaysCount,
+        due7: kpis.dueIn7DaysCount,
+        due14: kpis.dueIn14DaysCount,
+        vendorRisk: kpis.vendorConcentrationRisk,
+        topVendor: kpis.topVendor,
+      },
+      actions: actionCounts,
+      alerts,
+      topBills,
+      financialHealth: services.statementData?.metrics || null,
+      liquidity: services.bankData?.metrics || null,
+      paymentBehavior: services.paymentData?.metrics || null,
+    };
+
+    const prompt = `
+You are a finance operations assistant.
+
+Analyze this accounts payable data and output:
+
+1. Executive Summary
+2. Top 3 Risks
+3. Top 3 Actions
+4. Cash Flow Warning (if needed)
+
+Rules:
+- Be concise
+- Be practical
+- No fluff
+- Only use given data
+
+Data:
+${JSON.stringify(payload, null, 2)}
+`;
+
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4.1-mini',
+      temperature: 0.2,
+      messages: [
+        { role: 'system', content: 'You are a precise AP finance assistant.' },
+        { role: 'user', content: prompt },
+      ],
+    });
+
+    return response.choices?.[0]?.message?.content || 'AI summary unavailable.';
+  } catch (err) {
+    return `AI error: ${err.response?.data ? JSON.stringify(err.response.data) : err.message}`;
+  }
+}
+
+// ======================================================
+// STEP 9: PRODUCTIZATION HELPERS
+// ======================================================
+
+function getSystemStageLabel() {
+  return 'Step 9 Finance Blueprint';
+}
+
+// ======================================================
+// OAUTH ROUTES
+// ======================================================
+
 app.get('/', (req, res) => {
-  const oauthUrl =
+  const url =
     `https://appcenter.intuit.com/connect/oauth2` +
-    `?client_id=${encodeURIComponent(QB_CLIENT_ID)}` +
+    `?client_id=${encodeURIComponent(CLIENT_ID || '')}` +
     `&response_type=code` +
     `&scope=${encodeURIComponent('com.intuit.quickbooks.accounting')}` +
-    `&redirect_uri=${encodeURIComponent(QB_REDIRECT_URI)}` +
-    `&state=${encodeURIComponent(QB_OAUTH_STATE)}`;
+    `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` +
+    `&state=finance-blueprint-step9`;
 
   res.send(`
     <html>
-      <body style="font-family: Arial, sans-serif; padding: 30px;">
-        <h1>Final QuickBooks Blueprint API</h1>
-        <p>Universal SMB blueprint engine with remote intake and industry overlays.</p>
-        <p><a href="${oauthUrl}">Connect QuickBooks</a></p>
-        <ul>
-          <li><a href="/api/health">/api/health</a></li>
-          <li><a href="/api/templates">/api/templates</a></li>
-          <li><a href="/api/intake/schema">/api/intake/schema</a></li>
-          <li><a href="/api/final-blueprint">/api/final-blueprint</a></li>
-          <li><a href="/api/readiness">/api/readiness</a></li>
-          <li><a href="/api/priorities">/api/priorities</a></li>
-          <li><a href="/api/history">/api/history</a></li>
-        </ul>
+      <head>
+        <title>${getSystemStageLabel()}</title>
+        <style>
+          body { font-family: Arial, sans-serif; padding: 30px; }
+          a.button {
+            display: inline-block;
+            padding: 12px 18px;
+            background: #2b6cb0;
+            color: white;
+            text-decoration: none;
+            border-radius: 6px;
+          }
+        </style>
+      </head>
+      <body>
+        <h1>${getSystemStageLabel()}</h1>
+        <p>Connect QuickBooks, then open the dashboard.</p>
+        <a class="button" href="${url}">Connect QuickBooks</a>
       </body>
     </html>
   `);
@@ -1254,178 +1587,564 @@ app.get('/', (req, res) => {
 app.get('/callback', async (req, res) => {
   try {
     const code = req.query.code;
-    const state = req.query.state;
-    const callbackRealmId = req.query.realmId;
+    realmId = req.query.realmId;
 
-    if (state !== QB_OAUTH_STATE) {
-      return res.status(400).send('Invalid OAuth state.');
+    if (!code || !realmId) {
+      return res.status(400).send('Missing code or realmId from QuickBooks callback.');
     }
 
-    if (!code || !callbackRealmId) {
-      return res.status(400).send('Missing code or realmId.');
-    }
-
-    const response = await axios.post(
+    const tokenRes = await axios.post(
       'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer',
-      `grant_type=authorization_code&code=${encodeURIComponent(code)}&redirect_uri=${encodeURIComponent(QB_REDIRECT_URI)}`,
+      `grant_type=authorization_code&code=${encodeURIComponent(code)}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}`,
       {
         headers: {
-          Authorization: 'Basic ' + Buffer.from(`${QB_CLIENT_ID}:${QB_CLIENT_SECRET}`).toString('base64'),
+          Authorization: 'Basic ' + Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64'),
           'Content-Type': 'application/x-www-form-urlencoded',
           Accept: 'application/json',
         },
       }
     );
 
-    realmId = callbackRealmId;
-    accessToken = response.data.access_token;
-    refreshToken = response.data.refresh_token || '';
-    tokenExpiresAt = response.data.expires_in ? new Date(Date.now() + response.data.expires_in * 1000) : null;
-    refreshExpiresAt = response.data.x_refresh_token_expires_in ? new Date(Date.now() + response.data.x_refresh_token_expires_in * 1000) : null;
-
-    await saveConnection();
+    accessToken = tokenRes.data.access_token;
 
     res.send(`
       <html>
-        <body style="font-family: Arial, sans-serif; padding: 30px;">
-          <h1>Connected</h1>
-          <p>QuickBooks is connected.</p>
-          <p><a href="/api/final-blueprint">Open final blueprint</a></p>
+        <head>
+          <title>Connected</title>
+          <style>
+            body { font-family: Arial, sans-serif; padding: 30px; }
+            a.button {
+              display: inline-block;
+              padding: 12px 18px;
+              background: #2f855a;
+              color: white;
+              text-decoration: none;
+              border-radius: 6px;
+            }
+          </style>
+        </head>
+        <body>
+          <h1>Connected to QuickBooks</h1>
+          <p><strong>Realm ID:</strong> ${escapeHtml(realmId)}</p>
+          <a class="button" href="/bills">Open Dashboard</a>
         </body>
       </html>
     `);
   } catch (err) {
-    res.status(500).send(`<pre>${JSON.stringify(err.response?.data || err.message, null, 2)}</pre>`);
+    res.status(500).send(`<pre>${escapeHtml(err.response?.data ? JSON.stringify(err.response.data, null, 2) : err.message)}</pre>`);
   }
 });
 
-app.get('/api/health', async (req, res) => {
+// ======================================================
+// DASHBOARD
+// ======================================================
+
+app.get('/bills', async (req, res) => {
   try {
-    const saved = await pool.query(
-      `SELECT company_id, realm_id, updated_at
-       FROM qb_connections
-       WHERE company_id = $1
-       LIMIT 1`,
-      [COMPANY_ID]
+    if (!accessToken || !realmId) {
+      return res.send(`
+        <html>
+          <body style="font-family: Arial, sans-serif; padding: 30px;">
+            <h1>Not connected</h1>
+            <p>Please connect QuickBooks first.</p>
+            <a href="/">Go Home</a>
+          </body>
+        </html>
+      `);
+    }
+
+    const forceRefresh = req.query.refresh === 'true';
+const rawBills = await getBillsFromQuickBooks(forceRefresh);
+    lastSyncTime = new Date();
+    syncStatus = 'Success';
+
+    const services = await buildAllServices(rawBills);
+    const { unpaidBills, kpis, actionCounts, dataQualityCounts } = buildDashboardData(rawBills, services);
+    const alerts = buildAlerts(
+      unpaidBills,
+      kpis,
+      services.paymentData,
+      services.statementData,
+      services.bankData,
+      dataQualityCounts
     );
 
-    res.json({
-      ok: true,
-      companyId: COMPANY_ID,
-      quickbooksConnected: Boolean(accessToken && realmId),
-      savedConnection: saved.rowCount > 0,
-      realmId: realmId || saved.rows[0]?.realm_id || null,
-      lastSyncTime,
-      syncStatus,
-      environment: QB_ENV,
-    });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
+    const currentSnapshot = buildHistoricalSnapshot(unpaidBills, kpis, actionCounts);
+
+// ✅ ADD THIS LINE
+await saveSnapshot({
+  companyId: 'client-1',
+  totalAP: kpis.totalUnpaid,
+  overdueAP: kpis.overdueAmount,
+  totalAR: 0, // (you’re not calculating AR yet, so leave 0)
+  cash: services.bankData?.metrics?.availableCash || 0,
 });
 
-app.get('/api/templates', (req, res) => {
-  res.json({ ok: true, templates: INDUSTRY_TEMPLATES });
-});
+recordDashboardSnapshot(currentSnapshot);
 
-app.get('/api/intake/schema', async (req, res) => {
-  const industry = req.query.industry || 'general';
-  res.json({ ok: true, schema: buildRemoteIntakeSchema(industry) });
-});
+const previousSnapshot = getPreviousSnapshot();
+const historicalComparisons =
+  buildHistoricalComparisons(currentSnapshot, previousSnapshot);
 
-app.post('/api/intake', async (req, res) => {
-  try {
-    const industry = req.body.industry || 'general';
-    const payload = req.body.payload || {};
-    await saveIntakeProfile({ companyId: COMPANY_ID, industry, payload });
-    res.json({ ok: true, saved: true, industry, payload });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
+    const runAI = req.query.ai === 'true';
 
-app.get('/api/intake', async (req, res) => {
-  try {
-    const profile = await loadIntakeProfile(COMPANY_ID);
-    res.json({ ok: true, profile });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
+let aiSummary = 'AI summary not generated yet. Click "Generate AI Summary" to run it.';
 
-app.get('/api/final-blueprint', async (req, res) => {
-  try {
-    const industry = req.query.industry || 'general';
-    const payload = await buildFinalCoreBlueprint({
-      forceRefresh: req.query.refresh === 'true',
-      industry,
-    });
-
-    res.json({ ok: true, blueprint: payload });
-  } catch (err) {
-    syncStatus = 'Failed';
-    res.status(500).json({ ok: false, error: err.response?.data || err.message });
-  }
-});
-
-app.get('/api/readiness', async (req, res) => {
-  try {
-    const industry = req.query.industry || 'general';
-    const payload = await buildFinalCoreBlueprint({
-      forceRefresh: req.query.refresh === 'true',
-      industry,
-    });
-
-    res.json({
-      ok: true,
-      readiness: payload.readiness,
-      controls: payload.controls,
-      escalation: payload.escalation,
-      alerts: payload.alerts,
-    });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.response?.data || err.message });
-  }
-});
-
-app.get('/api/priorities', async (req, res) => {
-  try {
-    const industry = req.query.industry || 'general';
-    const payload = await buildFinalCoreBlueprint({
-      forceRefresh: req.query.refresh === 'true',
-      industry,
-    });
-
-    res.json({
-      ok: true,
-      payables: payload.payables.priorities,
-      receivables: payload.receivables.priorities,
-      recommendedActions: payload.recommendedActions,
-    });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.response?.data || err.message });
-  }
-});
-
-app.get('/api/history', async (req, res) => {
-  try {
-    const rows = await getSnapshotHistory(Number(req.query.limit || 12));
-    res.json({ ok: true, history: buildHistorySummary(rows) });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-async function boot() {
-  await initDB();
-  await loadConnection().catch(() => null);
-
-  app.listen(PORT, () => {
-    console.log(`Final QuickBooks Blueprint API running on port ${PORT}`);
+if (runAI) {
+  aiSummary = await generateAiSummary({
+    unpaidBills,
+    kpis,
+    actionCounts,
+    alerts,
+    services,
   });
 }
 
-boot().catch((err) => {
-  console.error('Fatal startup error:', err.message);
-  process.exit(1);
+    const rows = unpaidBills.map((bill) => {
+      let rowClass = '';
+      if (bill.recommendedAction === 'Pay Now') rowClass = 'pay-now';
+      else if (bill.recommendedAction === 'Pay Soon') rowClass = 'pay-soon';
+      else if (bill.recommendedAction === 'Review') rowClass = 'review';
+      else if (bill.recommendedAction === 'Monitor') rowClass = 'monitor';
+
+      return `
+        <tr class="${rowClass}">
+          <td>${escapeHtml(String(bill.decisionRank))}</td>
+          <td>${escapeHtml(bill.recommendedAction)}</td>
+          <td>${escapeHtml(bill.riskLevel)}</td>
+          <td>${escapeHtml(String(bill.priorityScore))}</td>
+          <td>${escapeHtml(bill.vendorCategory)}</td>
+          <td>${escapeHtml(formatBoolean(bill.isCriticalVendor))}</td>
+          <td>${escapeHtml(bill.vendorName)}</td>
+          <td>${escapeHtml(bill.billNo)}</td>
+          <td>${escapeHtml(bill.billDate)}</td>
+          <td>${escapeHtml(bill.dueDate || 'No Due Date')}</td>
+          <td>${escapeHtml(String(bill.daysUntilDue ?? 'N/A'))}</td>
+          <td>${escapeHtml(formatBoolean(bill.isOverdue))}</td>
+          <td>${escapeHtml(bill.agingBucket)}</td>
+          <td>${escapeHtml(bill.amountBucket)}</td>
+          <td>${formatMoney(bill.originalAmount, bill.currency)}</td>
+          <td>${formatMoney(bill.amountPaid, bill.currency)}</td>
+          <td>${formatMoney(bill.balance, bill.currency)}</td>
+          <td>${escapeHtml(bill.paymentStatus)}</td>
+          <td>${escapeHtml(bill.terms)}</td>
+          <td>${escapeHtml(bill.categorySummary)}</td>
+          <td>${escapeHtml(bill.account)}</td>
+          <td>${escapeHtml(bill.locationClass)}</td>
+          <td>${escapeHtml(bill.memo)}</td>
+          <td>${renderList(bill.urgencyDrivers)}</td>
+          <td>${renderList(bill.anomalyFlags)}</td>
+          <td>${renderList(bill.dataQualityFlags)}</td>
+          <td>${renderRuleHits(bill.ruleHits)}</td>
+          <td>${escapeHtml(bill.decisionReason)}</td>
+          <td>${escapeHtml(bill.explanationText)}</td>
+        </tr>
+      `;
+    }).join('');
+
+    const paymentMetrics = services.paymentData.metrics;
+    const statementMetrics = services.statementData.metrics;
+    const bankMetrics = services.bankData.metrics;
+
+    res.send(`
+      <html>
+        <head>
+          <title>${getSystemStageLabel()} Dashboard</title>
+          <style>
+            body { font-family: Arial, sans-serif; padding: 20px; }
+            h1, h2 { margin-bottom: 10px; }
+            .summary p { margin: 6px 0; }
+            .decision-summary, .kpi-grid, .section-grid, .quality-grid {
+              display: flex;
+              gap: 12px;
+              flex-wrap: wrap;
+              margin: 15px 0 20px 0;
+            }
+            .decision-card, .kpi-card {
+              border: 1px solid #ccc;
+              border-radius: 8px;
+              padding: 12px 14px;
+              min-width: 180px;
+              background: #fafafa;
+            }
+            .unavailable { background: #f8f8f8; color: #555; }
+            .panel {
+              margin: 18px 0;
+              padding: 14px;
+              border: 1px solid #ddd;
+              border-radius: 8px;
+              background: #fcfcfc;
+            }
+            .alert-card {
+              border-radius: 8px;
+              padding: 10px 12px;
+              border: 1px solid #ccc;
+              margin-bottom: 10px;
+            }
+            .alert-high { background: #ffe9e9; border-color: #e2a0a0; }
+            .alert-medium { background: #fff7e6; border-color: #e6c982; }
+            .alert-info { background: #eef6ff; border-color: #9ec2ea; }
+            table { border-collapse: collapse; width: 100%; margin-top: 20px; font-size: 14px; }
+            th, td {
+              border: 1px solid #ccc;
+              padding: 8px;
+              text-align: left;
+              vertical-align: top;
+              white-space: nowrap;
+            }
+            th { background: #f5f5f5; position: sticky; top: 0; }
+            .table-wrap { overflow-x: auto; max-width: 100%; }
+            .pay-now { background: #ffe5e5; }
+            .pay-soon { background: #fff4db; }
+            .review { background: #fffbe6; }
+            .monitor { background: #eef7ff; }
+            a.button {
+              display: inline-block;
+              margin-top: 15px;
+              margin-right: 10px;
+              padding: 10px 16px;
+              background: #2b6cb0;
+              color: white;
+              text-decoration: none;
+              border-radius: 6px;
+            }
+          </style>
+        </head>
+        <body>
+          <h1>${getSystemStageLabel()} Dashboard</h1>
+
+          <div class="summary">
+            <p><strong>Unpaid Bills:</strong> ${unpaidBills.length}</p>
+            <p><strong>Total Unpaid:</strong> ${formatMoney(kpis.totalUnpaid)}</p>
+            <p><strong>Last Sync Time:</strong> ${lastSyncTime ? escapeHtml(lastSyncTime.toLocaleString()) : 'N/A'}</p>
+            <p><strong>Sync Status:</strong> ${escapeHtml(syncStatus)}</p>
+
+          </div>
+
+          <div class="decision-summary">
+            <div class="decision-card"><strong>Pay Now</strong><br>${actionCounts.payNow}</div>
+            <div class="decision-card"><strong>Pay Soon</strong><br>${actionCounts.paySoon}</div>
+            <div class="decision-card"><strong>Review</strong><br>${actionCounts.review}</div>
+            <div class="decision-card"><strong>Monitor</strong><br>${actionCounts.monitor}</div>
+            <div class="decision-card"><strong>Later</strong><br>${actionCounts.later}</div>
+          </div>
+
+          <div class="panel">
+            <h2>AP KPI Summary</h2>
+            <div class="kpi-grid">
+              <div class="kpi-card"><strong>Overdue Bills</strong><br>${kpis.overdueBillsCount}</div>
+              <div class="kpi-card"><strong>Overdue Amount</strong><br>${formatMoney(kpis.overdueAmount)}</div>
+              <div class="kpi-card"><strong>Overdue % of Total</strong><br>${kpis.overduePercentOfTotal}%</div>
+              <div class="kpi-card"><strong>Due Next 3 Days</strong><br>${kpis.dueIn3DaysCount} / ${formatMoney(kpis.dueIn3DaysAmount)}</div>
+              <div class="kpi-card"><strong>Due Next 7 Days</strong><br>${kpis.dueIn7DaysCount} / ${formatMoney(kpis.dueIn7DaysAmount)}</div>
+              <div class="kpi-card"><strong>Due Next 14 Days</strong><br>${kpis.dueIn14DaysCount} / ${formatMoney(kpis.dueIn14DaysAmount)}</div>
+              <div class="kpi-card"><strong>Avg Days Overdue</strong><br>${kpis.averageDaysOverdue}</div>
+              <div class="kpi-card"><strong>Vendor Concentration Risk</strong><br>${escapeHtml(kpis.vendorConcentrationRisk)}</div>
+              <div class="kpi-card"><strong>Top Vendor Exposure</strong><br>${
+                kpis.topVendor
+                  ? `${escapeHtml(kpis.topVendor.vendorName)} — ${formatMoney(kpis.topVendor.amount)} (${kpis.topVendor.percentOfTotal}%)`
+                  : 'N/A'
+              }</div>
+              <div class="kpi-card"><strong>Largest Overdue Bill</strong><br>${
+                kpis.largestOverdueBill
+                  ? `${escapeHtml(kpis.largestOverdueBill.vendorName)} — ${formatMoney(kpis.largestOverdueBill.balance, kpis.largestOverdueBill.currency)}`
+                  : 'N/A'
+              }</div>
+            </div>
+          </div>
+
+<div class="panel">
+  <h2>Historical Trend Snapshot</h2>
+  ${
+    historicalComparisons
+      ? `
+        <div class="kpi-grid">
+          <div class="kpi-card">
+            <strong>Total Unpaid</strong><br>
+            ${escapeHtml(renderTrendValue(historicalComparisons.totalUnpaid, true))}
+          </div>
+          <div class="kpi-card">
+            <strong>Overdue Amount</strong><br>
+            ${escapeHtml(renderTrendValue(historicalComparisons.overdueAmount, true))}
+          </div>
+          <div class="kpi-card">
+            <strong>Overdue Bills</strong><br>
+            ${escapeHtml(renderTrendValue(historicalComparisons.overdueBillsCount))}
+          </div>
+          <div class="kpi-card">
+            <strong>Pay Now</strong><br>
+            ${escapeHtml(renderTrendValue(historicalComparisons.payNowCount))}
+          </div>
+          <div class="kpi-card">
+            <strong>Review</strong><br>
+            ${escapeHtml(renderTrendValue(historicalComparisons.reviewCount))}
+          </div>
+          <div class="kpi-card">
+            <strong>Total Bills</strong><br>
+            ${escapeHtml(renderTrendValue(historicalComparisons.unpaidBillsCount))}
+          </div>
+        </div>
+      `
+      : `<p>No previous snapshot yet. Refresh again to see trends.</p>`
+  }
+</div>
+
+          <div class="panel">
+            <h2>Data Quality Summary</h2>
+            <div class="quality-grid">
+              <div class="kpi-card"><strong>Missing Invoice Number</strong><br>${dataQualityCounts.missingInvoiceNumber}</div>
+              <div class="kpi-card"><strong>Missing Due Date</strong><br>${dataQualityCounts.missingDueDate}</div>
+              <div class="kpi-card"><strong>Missing Terms</strong><br>${dataQualityCounts.missingTerms}</div>
+              <div class="kpi-card"><strong>Missing Memo</strong><br>${dataQualityCounts.missingMemo}</div>
+            </div>
+          </div>
+
+<div class="panel">
+  <h2>AI Summary</h2>
+
+  <p style="white-space: pre-wrap;">
+    ${escapeHtml(aiSummary)}
+  </p>
+
+  <a class="button" href="/bills?ai=true">Generate AI Summary</a>
+  <a class="button" href="/bills">Clear</a>
+</div>
+
+          <div class="panel">
+            <h2>Top 3 Recommended Actions</h2>
+            <ol>
+              ${unpaidBills.slice(0, 3).map((bill) => `
+                <li>
+                  <strong>${escapeHtml(bill.vendorName)}</strong>
+                  — ${formatMoney(bill.balance, bill.currency)}
+                  — ${escapeHtml(bill.recommendedAction)}
+                  — Score: ${escapeHtml(String(bill.priorityScore))}
+                  — ${escapeHtml(bill.decisionReason)}
+                </li>
+              `).join('') || '<li>No unpaid bills found.</li>'}
+            </ol>
+          </div>
+
+          <div class="panel">
+            <h2>Alerts</h2>
+            ${renderAlerts(alerts)}
+          </div>
+
+          <div class="panel">
+            <h2>Payment Behavior Layer</h2>
+            <div class="section-grid">
+              ${services.paymentData.available && paymentMetrics
+                ? `
+                  <div class="kpi-card"><strong>Average Days to Pay</strong><br>${escapeHtml(String(paymentMetrics.averageDaysToPay ?? 'N/A'))}</div>
+                  <div class="kpi-card"><strong>Late Payment Rate</strong><br>${escapeHtml(String(paymentMetrics.latePaymentRate ?? 'N/A'))}%</div>
+                  <div class="kpi-card"><strong>Payments Analyzed</strong><br>${escapeHtml(String(paymentMetrics.analyzedPayments ?? 'N/A'))}</div>
+                  <div class="kpi-card"><strong>Vendors Tracked</strong><br>${escapeHtml(String(paymentMetrics.vendorsTracked ?? 'N/A'))}</div>
+                `
+                : renderUnavailableCard('Payment History', services.paymentData.reason)
+              }
+            </div>
+          </div>
+
+          <div class="panel">
+            <h2>Financial Health Layer</h2>
+            <div class="section-grid">
+              ${services.statementData.available && statementMetrics
+                ? `
+                  <div class="kpi-card"><strong>Current Ratio</strong><br>${escapeHtml(String(statementMetrics.currentRatio ?? 'N/A'))}</div>
+                  <div class="kpi-card"><strong>Working Capital</strong><br>${statementMetrics.workingCapital === null ? 'N/A' : formatMoney(statementMetrics.workingCapital)}</div>
+                  <div class="kpi-card"><strong>Net Income</strong><br>${statementMetrics.netIncome === null ? 'N/A' : formatMoney(statementMetrics.netIncome)}</div>
+                  <div class="kpi-card"><strong>Health Label</strong><br>${escapeHtml(String(statementMetrics.financialHealthLabel ?? 'N/A'))}</div>
+                `
+                : renderUnavailableCard('Statements', services.statementData.reason)
+              }
+            </div>
+          </div>
+
+          <div class="panel">
+            <h2>Liquidity Layer</h2>
+            <div class="section-grid">
+              ${services.bankData.available && bankMetrics
+                ? `
+                  <div class="kpi-card"><strong>Available Cash</strong><br>${formatMoney(bankMetrics.availableCash)}</div>
+                  <div class="kpi-card"><strong>Cash Coverage of Pay Now Bills</strong><br>${escapeHtml(String(bankMetrics.cashCoveragePayNow ?? 'N/A'))}%</div>
+                  <div class="kpi-card"><strong>Cash Coverage of Pay Now + Pay Soon</strong><br>${escapeHtml(String(bankMetrics.cashCoveragePayNowSoon ?? 'N/A'))}%</div>
+                  <div class="kpi-card"><strong>Bank Accounts Found</strong><br>${escapeHtml(String(bankMetrics.bankAccountCount ?? 'N/A'))}</div>
+                `
+                : renderUnavailableCard('Bank / Cash', services.bankData.reason)
+              }
+            </div>
+          </div>
+
+          <div class="panel">
+            <h2>Anomaly / Control Layer</h2>
+            <div class="section-grid">
+              <div class="kpi-card"><strong>Duplicate Warnings</strong><br>${unpaidBills.filter((b) => b.anomalyFlags.some((f) => normalizeText(f).includes('duplicate'))).length}</div>
+              <div class="kpi-card"><strong>Abnormal Amount Flags</strong><br>${unpaidBills.filter((b) => b.anomalyFlags.includes('Amount is unusually high vs vendor history')).length}</div>
+              <div class="kpi-card"><strong>Review Bucket</strong><br>${actionCounts.review}</div>
+            </div>
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Rank</th>
+                  <th>Action</th>
+                  <th>Risk</th>
+                  <th>Score</th>
+                  <th>Vendor Category</th>
+                  <th>Critical Vendor</th>
+                  <th>Vendor</th>
+                  <th>Bill No.</th>
+                  <th>Bill Date</th>
+                  <th>Due Date</th>
+                  <th>Days Until Due</th>
+                  <th>Is Overdue</th>
+                  <th>Aging Bucket</th>
+                  <th>Amount Bucket</th>
+                  <th>Original Amount</th>
+                  <th>Amount Paid</th>
+                  <th>Balance</th>
+                  <th>Payment Status</th>
+                  <th>Terms</th>
+                  <th>Category</th>
+                  <th>Account</th>
+                  <th>Location/Class</th>
+                  <th>Memo</th>
+                  <th>Urgency Drivers</th>
+                  <th>Anomaly Flags</th>
+                  <th>Data Quality Flags</th>
+                  <th>Rule Hits</th>
+                  <th>Decision Reason</th>
+                  <th>Explanation</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${rows || '<tr><td colspan="29">No unpaid bills found.</td></tr>'}
+              </tbody>
+            </table>
+          </div>
+<a class="button" href="/bills?refresh=true">Refresh Data</a>
+          <a class="button" href="/bills/download">Download CSV</a>
+          <a class="button" href="/">Back Home</a>
+        </body>
+      </html>
+    `);
+  } catch (err) {
+    syncStatus = 'Failed';
+    res.status(500).send(`<pre>${escapeHtml(err.response?.data ? JSON.stringify(err.response.data, null, 2) : err.message)}</pre>`);
+  }
+});
+
+// ======================================================
+// CSV DOWNLOAD
+// ======================================================
+
+app.get('/bills/download', async (req, res) => {
+  try {
+    if (!accessToken || !realmId) {
+      return res.status(400).send('Not connected to QuickBooks.');
+    }
+
+const forceRefresh = req.query.refresh === 'true';
+const rawBills = await getBillsFromQuickBooks(forceRefresh);
+    const services = await buildAllServices(rawBills);
+    const { unpaidBills } = buildDashboardData(rawBills, services);
+
+    const headers = [
+      'Rank',
+      'Action',
+      'Risk',
+      'Score',
+      'Vendor Category',
+      'Critical Vendor',
+      'Vendor',
+      'Bill ID',
+      'Bill No.',
+      'Vendor ID',
+      'Bill Date',
+      'Due Date',
+      'Days Until Due',
+      'Is Overdue',
+      'Aging Bucket',
+      'Amount Bucket',
+      'Original Amount',
+      'Amount Paid',
+      'Balance',
+      'Currency',
+      'Payment Status',
+      'Terms',
+      'Category Summary',
+      'Account',
+      'Location / Class',
+      'Memo',
+      'Urgency Drivers',
+      'Anomaly Flags',
+      'Data Quality Flags',
+      'Rule Hits',
+      'Decision Reason',
+      'Explanation',
+      'Vendor Avg Days To Pay',
+      'Vendor Late Payment Rate',
+    ];
+
+    const rows = unpaidBills.map((bill) => [
+      bill.decisionRank,
+      bill.recommendedAction,
+      bill.riskLevel,
+      bill.priorityScore,
+      bill.vendorCategory,
+      bill.isCriticalVendor,
+      bill.vendorName,
+      bill.billId,
+      bill.billNo,
+      bill.vendorId,
+      bill.billDate,
+      bill.dueDate || 'No Due Date',
+      bill.daysUntilDue ?? '',
+      bill.isOverdue,
+      bill.agingBucket,
+      bill.amountBucket,
+      bill.originalAmount,
+      bill.amountPaid,
+      bill.balance,
+      bill.currency,
+      bill.paymentStatus,
+      bill.terms,
+      bill.categorySummary,
+      bill.account,
+      bill.locationClass,
+      bill.memo,
+      bill.urgencyDrivers.join('; '),
+      bill.anomalyFlags.join('; '),
+      bill.dataQualityFlags.join('; '),
+      bill.ruleHits.map((hit) => `${hit.label} (+${hit.points}) [${hit.group}]`).join('; '),
+      bill.decisionReason,
+      bill.explanationText,
+      bill.paymentBehaviorSnapshot?.averageDaysToPay ?? '',
+      bill.paymentBehaviorSnapshot?.latePaymentRate ?? '',
+    ]);
+
+    const csv = [
+      headers.map(csvEscape).join(','),
+      ...rows.map((row) => row.map(csvEscape).join(',')),
+    ].join('\n');
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename="finance-blueprint-step9.csv"');
+    res.send(csv);
+  } catch (err) {
+    res.status(500).send(err.response?.data ? JSON.stringify(err.response.data, null, 2) : err.message);
+  }
+});
+
+// ======================================================
+// SERVER
+// ======================================================
+app.get('/test', (req, res) => {
+  res.send('Server works');
+});
+app.listen(PORT, async () => {
+  console.log(`Server running on port ${PORT}`);
+  await initDB();
 });
