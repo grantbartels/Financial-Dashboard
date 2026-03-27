@@ -3,6 +3,7 @@ console.log('OpenAI key loaded:', !!process.env.OPENAI_API_KEY);
 const express = require('express');
 const axios = require('axios');
 const OpenAI = require('openai');
+const crypto = require('crypto');
 
 const { Pool } = require('pg');
 
@@ -14,12 +15,12 @@ const pool = new Pool({
 });
 
 const app = express();
+app.use(express.json());
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// ✅ ADD THIS RIGHT HERE
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS dashboard_snapshots (
@@ -28,32 +29,117 @@ async function initDB() {
       total_ap NUMERIC,
       overdue_ap NUMERIC,
       total_ar NUMERIC,
+      overdue_ar NUMERIC DEFAULT 0,
       cash_balance NUMERIC,
+      hash_key TEXT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS qb_connections (
+      company_id TEXT PRIMARY KEY,
+      realm_id TEXT NOT NULL,
+      access_token TEXT NOT NULL,
+      refresh_token TEXT NOT NULL,
+      token_expires_at TIMESTAMP,
+      refresh_expires_at TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
   `);
 }
 
-// ✅ ADD THIS RIGHT HERE (directly under initDB)
-
 async function saveSnapshot(data) {
   try {
+    const payload = {
+      companyId: data.companyId || 'default',
+      totalAP: round2(data.totalAP || 0),
+      overdueAP: round2(data.overdueAP || 0),
+      totalAR: round2(data.totalAR || 0),
+      overdueAR: round2(data.overdueAR || 0),
+      cash: round2(data.cash || 0),
+    };
+
+    const hashKey = crypto
+      .createHash('sha256')
+      .update(JSON.stringify(payload))
+      .digest('hex');
+
+    const existing = await pool.query(
+      `SELECT id FROM dashboard_snapshots
+       WHERE company_id = $1 AND hash_key = $2
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [payload.companyId, hashKey]
+    );
+
+    if (existing.rowCount > 0) {
+      console.log('Snapshot skipped: no material change');
+      return;
+    }
+
     await pool.query(
       `INSERT INTO dashboard_snapshots
-      (company_id, total_ap, overdue_ap, total_ar, cash_balance)
-      VALUES ($1, $2, $3, $4, $5)`,
+      (company_id, total_ap, overdue_ap, total_ar, overdue_ar, cash_balance, hash_key)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)`,
       [
-        data.companyId || 'default',
-        data.totalAP || 0,
-        data.overdueAP || 0,
-        data.totalAR || 0,
-        data.cash || 0,
+        payload.companyId,
+        payload.totalAP,
+        payload.overdueAP,
+        payload.totalAR,
+        payload.overdueAR,
+        payload.cash,
+        hashKey,
       ]
     );
 
     console.log('Snapshot saved to database');
   } catch (err) {
     console.error('Error saving snapshot:', err.message);
+  }
+}
+
+async function saveConnection(data) {
+  await pool.query(
+    `INSERT INTO qb_connections
+      (company_id, realm_id, access_token, refresh_token, token_expires_at, refresh_expires_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)
+     ON CONFLICT (company_id)
+     DO UPDATE SET
+       realm_id = EXCLUDED.realm_id,
+       access_token = EXCLUDED.access_token,
+       refresh_token = EXCLUDED.refresh_token,
+       token_expires_at = EXCLUDED.token_expires_at,
+       refresh_expires_at = EXCLUDED.refresh_expires_at,
+       updated_at = CURRENT_TIMESTAMP`,
+    [
+      data.companyId,
+      data.realmId,
+      data.accessToken,
+      data.refreshToken,
+      data.tokenExpiresAt,
+      data.refreshExpiresAt,
+    ]
+  );
+}
+
+async function loadConnection(companyId = 'client-1') {
+  const result = await pool.query(
+    `SELECT * FROM qb_connections WHERE company_id = $1 LIMIT 1`,
+    [companyId]
+  );
+  return result.rows[0] || null;
+}
+
+async function hydrateDefaultConnection() {
+  try {
+    const connection = await loadConnection('client-1');
+    if (!connection) return;
+    realmId = connection.realm_id || '';
+    accessToken = connection.access_token || '';
+    refreshToken = connection.refresh_token || '';
+  } catch (err) {
+    console.error('Failed loading saved QuickBooks connection:', err.message);
   }
 }
 
@@ -73,6 +159,7 @@ const QB_BASE_URL =
     : 'https://sandbox-quickbooks.api.intuit.com';
 
 let accessToken = '';
+let refreshToken = '';
 let realmId = '';
 let lastSyncTime = null;
 let syncStatus = 'Not synced';
@@ -82,7 +169,8 @@ let billsCache = {
   fetchedAt: null,
 };
 
-const CACHE_TTL_MS = 60 * 1000; // 60 seconds
+const CACHE_TTL_MS = 60 * 1000;
+const OAUTH_STATE = 'finance-blueprint-step9';
 
 let dashboardHistory = [];
 const HISTORY_LIMIT = 50;
@@ -372,18 +460,59 @@ function daysBetween(start, end) {
 // QUICKBOOKS HELPERS
 // ======================================================
 
-async function qbGet(path, params = {}) {
+async function refreshQuickBooksAccessToken() {
+  if (!refreshToken) {
+    throw new Error('QuickBooks refresh token missing');
+  }
+
+  const tokenRes = await axios.post(
+    'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer',
+    `grant_type=refresh_token&refresh_token=${encodeURIComponent(refreshToken)}`,
+    {
+      headers: {
+        Authorization: 'Basic ' + Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64'),
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Accept: 'application/json',
+      },
+    }
+  );
+
+  accessToken = tokenRes.data.access_token;
+  refreshToken = tokenRes.data.refresh_token || refreshToken;
+
+  await saveConnection({
+    companyId: 'client-1',
+    realmId,
+    accessToken,
+    refreshToken,
+    tokenExpiresAt: tokenRes.data.expires_in ? new Date(Date.now() + tokenRes.data.expires_in * 1000) : null,
+    refreshExpiresAt: tokenRes.data.x_refresh_token_expires_in ? new Date(Date.now() + tokenRes.data.x_refresh_token_expires_in * 1000) : null,
+  });
+
+  return accessToken;
+}
+
+async function qbGet(path, params = {}, attempt = 0) {
   if (!accessToken || !realmId) {
     throw new Error('QuickBooks not connected');
   }
 
-  return axios.get(`${QB_BASE_URL}${path}`, {
-    params,
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      Accept: 'application/json',
-    },
-  });
+  try {
+    return await axios.get(`${QB_BASE_URL}${path}`, {
+      params,
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: 'application/json',
+      },
+    });
+  } catch (err) {
+    const status = err.response?.status;
+    if (status === 401 && attempt === 0 && refreshToken) {
+      await refreshQuickBooksAccessToken();
+      return qbGet(path, params, attempt + 1);
+    }
+    throw err;
+  }
 }
 
 async function qbQuery(sql) {
@@ -417,6 +546,24 @@ async function getBillsFromQuickBooks(forceRefresh = false) {
   };
 
   return normalizedBills;
+}
+
+async function getInvoicesFromQuickBooks() {
+  try {
+    const response = await qbQuery('SELECT * FROM Invoice MAXRESULTS 1000');
+    return response.data.QueryResponse?.Invoice || [];
+  } catch {
+    return [];
+  }
+}
+
+async function getCustomersFromQuickBooks() {
+  try {
+    const response = await qbQuery('SELECT * FROM Customer MAXRESULTS 1000');
+    return response.data.QueryResponse?.Customer || [];
+  } catch {
+    return [];
+  }
 }
 
 async function getBillPaymentsFromQuickBooks() {
@@ -459,6 +606,114 @@ async function getBalanceSheetReport() {
   } catch {
     return null;
   }
+}
+
+function normalizeQuickBooksInvoice(invoice) {
+  return {
+    ...invoice,
+    TxnDate: normalizeDateString(invoice.TxnDate),
+    DueDate: normalizeDateString(invoice.DueDate),
+    TotalAmt: normalizeNumber(invoice.TotalAmt, 0),
+    Balance: normalizeNumber(invoice.Balance, 0),
+    CustomerRef: {
+      ...invoice.CustomerRef,
+      name: normalizeVendorName(invoice.CustomerRef?.name),
+    },
+  };
+}
+
+function buildOpenInvoices(rawInvoices = []) {
+  return rawInvoices
+    .map(normalizeQuickBooksInvoice)
+    .filter((invoice) => Number(invoice.Balance || 0) > 0)
+    .map((invoice) => {
+      const daysUntilDue = getDaysUntilDue(invoice.DueDate);
+      return {
+        invoiceId: safeText(invoice.Id),
+        customerName: safeText(invoice.CustomerRef?.name, 'Unknown Customer'),
+        invoiceNo: safeText(invoice.DocNumber),
+        invoiceDate: safeText(invoice.TxnDate),
+        dueDate: invoice.DueDate || null,
+        balance: round2(invoice.Balance || 0),
+        totalAmount: round2(invoice.TotalAmt || 0),
+        daysUntilDue,
+        isOverdue: daysUntilDue !== null && daysUntilDue < 0,
+        agingBucket: getAgingBucket(daysUntilDue),
+      };
+    });
+}
+
+function buildArSummary(openInvoices) {
+  const totalAR = round2(openInvoices.reduce((sum, invoice) => sum + Number(invoice.balance || 0), 0));
+  const overdueInvoices = openInvoices.filter((invoice) => invoice.isOverdue);
+
+  const customerMap = new Map();
+  for (const invoice of openInvoices) {
+    customerMap.set(
+      invoice.customerName,
+      round2((customerMap.get(invoice.customerName) || 0) + Number(invoice.balance || 0))
+    );
+  }
+
+  return {
+    totalAR,
+    overdueAR: round2(overdueInvoices.reduce((sum, invoice) => sum + Number(invoice.balance || 0), 0)),
+    overdueCount: overdueInvoices.length,
+    openInvoiceCount: openInvoices.length,
+    openCount: openInvoices.length,
+    overduePercent: totalAR
+      ? round2(
+          (overdueInvoices.reduce((sum, invoice) => sum + Number(invoice.balance || 0), 0) / totalAR) * 100
+        )
+      : 0,
+    topCustomers: [...customerMap.entries()]
+      .map(([customerName, balance]) => ({
+        customerName,
+        balance,
+        percentOfTotal: totalAR ? round2((balance / totalAR) * 100) : 0,
+      }))
+      .sort((a, b) => b.balance - a.balance)
+      .slice(0, 5),
+  };
+}
+
+async function getArService() {
+  const rawInvoices = await getInvoicesFromQuickBooks();
+  const openInvoices = buildOpenInvoices(rawInvoices);
+  return {
+    available: true,
+    reason: null,
+    openInvoices,
+    metrics: buildArSummary(openInvoices),
+  };
+}
+
+async function getInventoryDiagnosticsService() {
+  const [pnl, balanceSheet] = await Promise.all([
+    getProfitAndLossReport(),
+    getBalanceSheetReport(),
+  ]);
+
+  if (!pnl && !balanceSheet) {
+    return {
+      available: false,
+      reason: 'Inventory / COGS reports unavailable.',
+      metrics: null,
+    };
+  }
+
+  const inventoryAsset = findReportValueByLabels(balanceSheet, ['inventory asset', 'inventory']);
+  const cogs = findReportValueByLabels(pnl, ['cost of goods sold', 'total cost of goods sold']);
+
+  return {
+    available: true,
+    reason: null,
+    metrics: {
+      inventoryAsset,
+      cogs,
+      missingCogsSignal: inventoryAsset !== null && inventoryAsset > 0 && (!cogs || cogs <= 0),
+    },
+  };
 }
 
 // ======================================================
@@ -559,12 +814,14 @@ function buildPaymentHistoryMetrics(rawBills, billPayments) {
   return {
     available: analyzedPayments > 0,
     reason: analyzedPayments > 0 ? null : 'BillPayment records did not map cleanly to bills.',
-    metrics: analyzedPayments > 0 ? {
-      averageDaysToPay: average(allDaysToPay),
-      latePaymentRate: round2((lateCount / analyzedPayments) * 100),
-      analyzedPayments,
-      vendorsTracked: Object.keys(vendorStats).length,
-    } : null,
+    metrics: analyzedPayments > 0
+      ? {
+          averageDaysToPay: average(allDaysToPay),
+          latePaymentRate: round2((lateCount / analyzedPayments) * 100),
+          analyzedPayments,
+          vendorsTracked: Object.keys(vendorStats).length,
+        }
+      : null,
     vendorStats,
     billPaymentMap: Object.fromEntries(billPaymentMap.entries()),
   };
@@ -674,7 +931,10 @@ async function getBankCashService() {
 
   const bankAccounts = accounts.filter((account) => ['Bank', 'Other Current Asset'].includes(account.AccountType));
   const availableCash = round2(
-    bankAccounts.reduce((sum, account) => sum + Number(account.CurrentBalance || account.CurrentBalanceWithSubAccounts || 0), 0)
+    bankAccounts.reduce(
+      (sum, account) => sum + Number(account.CurrentBalance || account.CurrentBalanceWithSubAccounts || 0),
+      0
+    )
   );
 
   return {
@@ -700,9 +960,8 @@ function augmentBankCashMetrics(bankData, unpaidBills) {
   const paySoonAmount = round2(paySoonBills.reduce((sum, bill) => sum + bill.balance, 0));
   const availableCash = Number(bankData.metrics.availableCash || 0);
   const cashCoveragePayNow = payNowAmount > 0 ? round2((availableCash / payNowAmount) * 100) : null;
-  const cashCoveragePayNowSoon = (payNowAmount + paySoonAmount) > 0
-    ? round2((availableCash / (payNowAmount + paySoonAmount)) * 100)
-    : null;
+  const cashCoveragePayNowSoon =
+    payNowAmount + paySoonAmount > 0 ? round2((availableCash / (payNowAmount + paySoonAmount)) * 100) : null;
 
   return {
     ...bankData,
@@ -762,7 +1021,6 @@ function getTerms(bill) {
   return safeText(bill.SalesTermRef?.name || bill.TermRef?.name);
 }
 
-// ✅ PASTE HERE
 // ======================================================
 // DATA NORMALIZATION LAYER
 // ======================================================
@@ -808,8 +1066,6 @@ function normalizeQuickBooksBill(bill) {
 function normalizeQuickBooksBills(rawBills = []) {
   return rawBills.map(normalizeQuickBooksBill);
 }
-
-// ======================================================
 
 function buildBaseProcessedBills(rawBills) {
   return rawBills.map((bill) => {
@@ -1021,7 +1277,10 @@ function applyRulesToBill(bill, context) {
     }
 
     if (avgDaysToPay > 0 && bill.daysUntilDue >= 0 && avgDaysToPay > bill.daysUntilDue + 5) {
-      addScore(CONFIG.weights.abnormalPaymentTiming, `Abnormal payment timing vs vendor history (${avgDaysToPay} avg days to pay)`);
+      addScore(
+        CONFIG.weights.abnormalPaymentTiming,
+        `Abnormal payment timing vs vendor history (${avgDaysToPay} avg days to pay)`
+      );
     }
   }
 
@@ -1199,13 +1458,15 @@ function buildKpiSummary(unpaidBills) {
   };
 }
 
-function buildHistoricalSnapshot(unpaidBills, kpis, actionCounts) {
+function buildHistoricalSnapshot(unpaidBills, kpis, actionCounts, arMetrics = null) {
   return {
     capturedAt: new Date().toISOString(),
     unpaidBillsCount: unpaidBills.length,
     totalUnpaid: kpis.totalUnpaid,
     overdueBillsCount: kpis.overdueBillsCount,
     overdueAmount: kpis.overdueAmount,
+    totalAR: arMetrics?.totalAR || 0,
+    overdueAR: arMetrics?.overdueAR || 0,
     overduePercentOfTotal: kpis.overduePercentOfTotal,
     dueIn3DaysCount: kpis.dueIn3DaysCount,
     dueIn7DaysCount: kpis.dueIn7DaysCount,
@@ -1254,6 +1515,8 @@ function buildHistoricalComparisons(currentSnapshot, previousSnapshot) {
     totalUnpaid: buildTrend(currentSnapshot.totalUnpaid, previousSnapshot.totalUnpaid),
     overdueAmount: buildTrend(currentSnapshot.overdueAmount, previousSnapshot.overdueAmount),
     overdueBillsCount: buildTrend(currentSnapshot.overdueBillsCount, previousSnapshot.overdueBillsCount),
+    totalAR: buildTrend(currentSnapshot.totalAR, previousSnapshot.totalAR),
+    overdueAR: buildTrend(currentSnapshot.overdueAR, previousSnapshot.overdueAR),
     payNowCount: buildTrend(currentSnapshot.payNowCount, previousSnapshot.payNowCount),
     reviewCount: buildTrend(currentSnapshot.reviewCount, previousSnapshot.reviewCount),
     unpaidBillsCount: buildTrend(currentSnapshot.unpaidBillsCount, previousSnapshot.unpaidBillsCount),
@@ -1263,9 +1526,7 @@ function buildHistoricalComparisons(currentSnapshot, previousSnapshot) {
 function renderTrendValue(trend, isMoney = false) {
   if (!trend) return 'No prior snapshot';
 
-  const deltaText = isMoney
-    ? formatMoney(trend.delta)
-    : String(trend.delta);
+  const deltaText = isMoney ? formatMoney(trend.delta) : String(trend.delta);
 
   const direction =
     trend.direction === 'up' ? '↑ Up' :
@@ -1294,7 +1555,7 @@ function buildDataQualityCounts(unpaidBills) {
   };
 }
 
-function buildAlerts(unpaidBills, kpis, paymentData, statementData, bankData, dataQualityCounts) {
+function buildAlerts(unpaidBills, kpis, paymentData, statementData, bankData, dataQualityCounts, arData = null, inventoryData = null) {
   const alerts = [];
 
   if (kpis.overduePercentOfTotal >= 40) {
@@ -1328,6 +1589,22 @@ function buildAlerts(unpaidBills, kpis, paymentData, statementData, bankData, da
       severity: 'Medium',
       title: 'Abnormal bill amounts detected',
       detail: `${abnormalAmountCount} unpaid bill(s) appear unusually high versus vendor history.`,
+    });
+  }
+
+  if (arData?.available && arData.metrics?.overdueAR > 0) {
+    alerts.push({
+      severity: arData.metrics.overduePercent >= 40 ? 'High' : 'Medium',
+      title: 'Accounts receivable overdue',
+      detail: `${formatMoney(arData.metrics.overdueAR)} of receivables are overdue across ${arData.metrics.overdueCount} invoice(s).`,
+    });
+  }
+
+  if (inventoryData?.available && inventoryData.metrics?.missingCogsSignal) {
+    alerts.push({
+      severity: 'High',
+      title: 'Inventory / COGS mismatch',
+      detail: 'Inventory asset exists on the balance sheet, but COGS appears missing or zero on the P&L.',
     });
   }
 
@@ -1436,10 +1713,12 @@ function buildDashboardData(rawBills, services) {
 }
 
 async function buildAllServices(rawBills) {
-  const [billPayments, statementDataRaw, bankDataRaw] = await Promise.all([
+  const [billPayments, statementDataRaw, bankDataRaw, arData, inventoryData] = await Promise.all([
     getBillPaymentsFromQuickBooks(),
     getStatementsService(),
     getBankCashService(),
+    getArService(),
+    getInventoryDiagnosticsService(),
   ]);
 
   const paymentData = buildPaymentHistoryMetrics(rawBills, billPayments);
@@ -1447,6 +1726,8 @@ async function buildAllServices(rawBills) {
     paymentData,
     statementData: statementDataRaw,
     bankData: bankDataRaw,
+    arData,
+    inventoryData,
   };
 
   const firstPass = buildDashboardData(rawBills, initialServices);
@@ -1456,6 +1737,8 @@ async function buildAllServices(rawBills) {
     paymentData,
     statementData: statementDataRaw,
     bankData,
+    arData,
+    inventoryData,
   };
 }
 
@@ -1546,6 +1829,38 @@ function getSystemStageLabel() {
   return 'Step 9 Finance Blueprint';
 }
 
+async function runAutomatedDailySnapshot() {
+  try {
+    if (!accessToken || !realmId) {
+      console.log('Daily automation skipped: QuickBooks not connected');
+      return;
+    }
+
+    console.log('Running daily automated snapshot...');
+
+    const rawBills = await getBillsFromQuickBooks(true);
+    const services = await buildAllServices(rawBills);
+    const { unpaidBills, kpis, actionCounts } = buildDashboardData(rawBills, services);
+
+    const currentSnapshot = buildHistoricalSnapshot(unpaidBills, kpis, actionCounts, services.arData?.metrics);
+
+    await saveSnapshot({
+      companyId: 'client-1',
+      totalAP: kpis.totalUnpaid,
+      overdueAP: kpis.overdueAmount,
+      totalAR: services.arData?.metrics?.totalAR || 0,
+      overdueAR: services.arData?.metrics?.overdueAR || 0,
+      cash: services.bankData?.metrics?.availableCash || 0,
+    });
+
+    recordDashboardSnapshot(currentSnapshot);
+
+    console.log('Daily automated snapshot complete');
+  } catch (err) {
+    console.error('Daily automation failed:', err.message);
+  }
+}
+
 // ======================================================
 // OAUTH ROUTES
 // ======================================================
@@ -1557,7 +1872,7 @@ app.get('/', (req, res) => {
     `&response_type=code` +
     `&scope=${encodeURIComponent('com.intuit.quickbooks.accounting')}` +
     `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` +
-    `&state=finance-blueprint-step9`;
+    `&state=${encodeURIComponent(OAUTH_STATE)}`;
 
   res.send(`
     <html>
@@ -1587,7 +1902,12 @@ app.get('/', (req, res) => {
 app.get('/callback', async (req, res) => {
   try {
     const code = req.query.code;
+    const state = req.query.state;
     realmId = req.query.realmId;
+
+    if (state !== OAUTH_STATE) {
+      return res.status(400).send('Invalid OAuth state.');
+    }
 
     if (!code || !realmId) {
       return res.status(400).send('Missing code or realmId from QuickBooks callback.');
@@ -1606,6 +1926,16 @@ app.get('/callback', async (req, res) => {
     );
 
     accessToken = tokenRes.data.access_token;
+    refreshToken = tokenRes.data.refresh_token || '';
+
+    await saveConnection({
+      companyId: 'client-1',
+      realmId,
+      accessToken,
+      refreshToken,
+      tokenExpiresAt: tokenRes.data.expires_in ? new Date(Date.now() + tokenRes.data.expires_in * 1000) : null,
+      refreshExpiresAt: tokenRes.data.x_refresh_token_expires_in ? new Date(Date.now() + tokenRes.data.x_refresh_token_expires_in * 1000) : null,
+    });
 
     res.send(`
       <html>
@@ -1654,7 +1984,7 @@ app.get('/bills', async (req, res) => {
     }
 
     const forceRefresh = req.query.refresh === 'true';
-const rawBills = await getBillsFromQuickBooks(forceRefresh);
+    const rawBills = await getBillsFromQuickBooks(forceRefresh);
     lastSyncTime = new Date();
     syncStatus = 'Success';
 
@@ -1666,39 +1996,41 @@ const rawBills = await getBillsFromQuickBooks(forceRefresh);
       services.paymentData,
       services.statementData,
       services.bankData,
-      dataQualityCounts
+      dataQualityCounts,
+      services.arData,
+      services.inventoryData
     );
 
-    const currentSnapshot = buildHistoricalSnapshot(unpaidBills, kpis, actionCounts);
+    const currentSnapshot = buildHistoricalSnapshot(unpaidBills, kpis, actionCounts, services.arData?.metrics);
 
-// ✅ ADD THIS LINE
-await saveSnapshot({
-  companyId: 'client-1',
-  totalAP: kpis.totalUnpaid,
-  overdueAP: kpis.overdueAmount,
-  totalAR: 0, // (you’re not calculating AR yet, so leave 0)
-  cash: services.bankData?.metrics?.availableCash || 0,
-});
+    await saveSnapshot({
+      companyId: 'client-1',
+      totalAP: kpis.totalUnpaid,
+      overdueAP: kpis.overdueAmount,
+      totalAR: services.arData?.metrics?.totalAR || 0,
+      overdueAR: services.arData?.metrics?.overdueAR || 0,
+      cash: services.bankData?.metrics?.availableCash || 0,
+    });
 
-recordDashboardSnapshot(currentSnapshot);
+    recordDashboardSnapshot(currentSnapshot);
 
-const previousSnapshot = getPreviousSnapshot();
-const historicalComparisons =
-  buildHistoricalComparisons(currentSnapshot, previousSnapshot);
+    const previousSnapshot = getPreviousSnapshot();
+    const historicalComparisons =
+      buildHistoricalComparisons(currentSnapshot, previousSnapshot);
 
     const runAI = req.query.ai === 'true';
 
-let aiSummary = 'AI summary not generated yet. Click "Generate AI Summary" to run it.';
+    let aiSummary = 'AI summary not generated yet. Click "Generate AI Summary" to run it.';
 
-if (runAI) {
-  aiSummary = await generateAiSummary({
-    unpaidBills,
-    kpis,
-    actionCounts,
-    alerts,
-    services,
-  });
-}
+    if (runAI) {
+      aiSummary = await generateAiSummary({
+        unpaidBills,
+        kpis,
+        actionCounts,
+        alerts,
+        services,
+      });
+    }
 
     const rows = unpaidBills.map((bill) => {
       let rowClass = '';
@@ -1818,7 +2150,6 @@ if (runAI) {
             <p><strong>Total Unpaid:</strong> ${formatMoney(kpis.totalUnpaid)}</p>
             <p><strong>Last Sync Time:</strong> ${lastSyncTime ? escapeHtml(lastSyncTime.toLocaleString()) : 'N/A'}</p>
             <p><strong>Sync Status:</strong> ${escapeHtml(syncStatus)}</p>
-
           </div>
 
           <div class="decision-summary">
@@ -1853,41 +2184,35 @@ if (runAI) {
             </div>
           </div>
 
-<div class="panel">
-  <h2>Historical Trend Snapshot</h2>
-  ${
-    historicalComparisons
-      ? `
-        <div class="kpi-grid">
-          <div class="kpi-card">
-            <strong>Total Unpaid</strong><br>
-            ${escapeHtml(renderTrendValue(historicalComparisons.totalUnpaid, true))}
+          <div class="panel">
+            <h2>AR Summary</h2>
+            <div class="kpi-grid">
+              <div class="kpi-card"><strong>Open AR</strong><br>${formatMoney(services.arData?.metrics?.totalAR || 0)}</div>
+              <div class="kpi-card"><strong>Overdue AR</strong><br>${formatMoney(services.arData?.metrics?.overdueAR || 0)}</div>
+              <div class="kpi-card"><strong>Overdue AR %</strong><br>${escapeHtml(String(services.arData?.metrics?.overduePercent || 0))}%</div>
+              <div class="kpi-card"><strong>Open Invoices</strong><br>${escapeHtml(String(services.arData?.metrics?.openInvoiceCount || 0))}</div>
+            </div>
           </div>
-          <div class="kpi-card">
-            <strong>Overdue Amount</strong><br>
-            ${escapeHtml(renderTrendValue(historicalComparisons.overdueAmount, true))}
+
+          <div class="panel">
+            <h2>Historical Trend Snapshot</h2>
+            ${
+              historicalComparisons
+                ? `
+                  <div class="kpi-grid">
+                    <div class="kpi-card"><strong>Total Unpaid</strong><br>${escapeHtml(renderTrendValue(historicalComparisons.totalUnpaid, true))}</div>
+                    <div class="kpi-card"><strong>Overdue Amount</strong><br>${escapeHtml(renderTrendValue(historicalComparisons.overdueAmount, true))}</div>
+                    <div class="kpi-card"><strong>Overdue Bills</strong><br>${escapeHtml(renderTrendValue(historicalComparisons.overdueBillsCount))}</div>
+                    <div class="kpi-card"><strong>Total AR</strong><br>${escapeHtml(renderTrendValue(historicalComparisons.totalAR, true))}</div>
+                    <div class="kpi-card"><strong>Overdue AR</strong><br>${escapeHtml(renderTrendValue(historicalComparisons.overdueAR, true))}</div>
+                    <div class="kpi-card"><strong>Pay Now</strong><br>${escapeHtml(renderTrendValue(historicalComparisons.payNowCount))}</div>
+                    <div class="kpi-card"><strong>Review</strong><br>${escapeHtml(renderTrendValue(historicalComparisons.reviewCount))}</div>
+                    <div class="kpi-card"><strong>Total Bills</strong><br>${escapeHtml(renderTrendValue(historicalComparisons.unpaidBillsCount))}</div>
+                  </div>
+                `
+                : `<p>No previous snapshot yet. Refresh again to see trends.</p>`
+            }
           </div>
-          <div class="kpi-card">
-            <strong>Overdue Bills</strong><br>
-            ${escapeHtml(renderTrendValue(historicalComparisons.overdueBillsCount))}
-          </div>
-          <div class="kpi-card">
-            <strong>Pay Now</strong><br>
-            ${escapeHtml(renderTrendValue(historicalComparisons.payNowCount))}
-          </div>
-          <div class="kpi-card">
-            <strong>Review</strong><br>
-            ${escapeHtml(renderTrendValue(historicalComparisons.reviewCount))}
-          </div>
-          <div class="kpi-card">
-            <strong>Total Bills</strong><br>
-            ${escapeHtml(renderTrendValue(historicalComparisons.unpaidBillsCount))}
-          </div>
-        </div>
-      `
-      : `<p>No previous snapshot yet. Refresh again to see trends.</p>`
-  }
-</div>
 
           <div class="panel">
             <h2>Data Quality Summary</h2>
@@ -1899,29 +2224,27 @@ if (runAI) {
             </div>
           </div>
 
-<div class="panel">
-  <h2>AI Summary</h2>
-
-  <p style="white-space: pre-wrap;">
-    ${escapeHtml(aiSummary)}
-  </p>
-
-  <a class="button" href="/bills?ai=true">Generate AI Summary</a>
-  <a class="button" href="/bills">Clear</a>
-</div>
+          <div class="panel">
+            <h2>AI Summary</h2>
+            <p style="white-space: pre-wrap;">${escapeHtml(aiSummary)}</p>
+            <a class="button" href="/bills?refresh=true&ai=true">Refresh + Generate AI Summary</a>
+            <a class="button" href="/bills">Clear</a>
+          </div>
 
           <div class="panel">
             <h2>Top 3 Recommended Actions</h2>
             <ol>
-              ${unpaidBills.slice(0, 3).map((bill) => `
-                <li>
-                  <strong>${escapeHtml(bill.vendorName)}</strong>
-                  — ${formatMoney(bill.balance, bill.currency)}
-                  — ${escapeHtml(bill.recommendedAction)}
-                  — Score: ${escapeHtml(String(bill.priorityScore))}
-                  — ${escapeHtml(bill.decisionReason)}
-                </li>
-              `).join('') || '<li>No unpaid bills found.</li>'}
+              ${
+                unpaidBills.slice(0, 3).map((bill) => `
+                  <li>
+                    <strong>${escapeHtml(bill.vendorName)}</strong>
+                    — ${formatMoney(bill.balance, bill.currency)}
+                    — ${escapeHtml(bill.recommendedAction)}
+                    — Score: ${escapeHtml(String(bill.priorityScore))}
+                    — ${escapeHtml(bill.decisionReason)}
+                  </li>
+                `).join('') || '<li>No unpaid bills found.</li>'
+              }
             </ol>
           </div>
 
@@ -1933,14 +2256,15 @@ if (runAI) {
           <div class="panel">
             <h2>Payment Behavior Layer</h2>
             <div class="section-grid">
-              ${services.paymentData.available && paymentMetrics
-                ? `
-                  <div class="kpi-card"><strong>Average Days to Pay</strong><br>${escapeHtml(String(paymentMetrics.averageDaysToPay ?? 'N/A'))}</div>
-                  <div class="kpi-card"><strong>Late Payment Rate</strong><br>${escapeHtml(String(paymentMetrics.latePaymentRate ?? 'N/A'))}%</div>
-                  <div class="kpi-card"><strong>Payments Analyzed</strong><br>${escapeHtml(String(paymentMetrics.analyzedPayments ?? 'N/A'))}</div>
-                  <div class="kpi-card"><strong>Vendors Tracked</strong><br>${escapeHtml(String(paymentMetrics.vendorsTracked ?? 'N/A'))}</div>
-                `
-                : renderUnavailableCard('Payment History', services.paymentData.reason)
+              ${
+                services.paymentData.available && paymentMetrics
+                  ? `
+                    <div class="kpi-card"><strong>Average Days to Pay</strong><br>${escapeHtml(String(paymentMetrics.averageDaysToPay ?? 'N/A'))}</div>
+                    <div class="kpi-card"><strong>Late Payment Rate</strong><br>${escapeHtml(String(paymentMetrics.latePaymentRate ?? 'N/A'))}%</div>
+                    <div class="kpi-card"><strong>Payments Analyzed</strong><br>${escapeHtml(String(paymentMetrics.analyzedPayments ?? 'N/A'))}</div>
+                    <div class="kpi-card"><strong>Vendors Tracked</strong><br>${escapeHtml(String(paymentMetrics.vendorsTracked ?? 'N/A'))}</div>
+                  `
+                  : renderUnavailableCard('Payment History', services.paymentData.reason)
               }
             </div>
           </div>
@@ -1948,14 +2272,30 @@ if (runAI) {
           <div class="panel">
             <h2>Financial Health Layer</h2>
             <div class="section-grid">
-              ${services.statementData.available && statementMetrics
-                ? `
-                  <div class="kpi-card"><strong>Current Ratio</strong><br>${escapeHtml(String(statementMetrics.currentRatio ?? 'N/A'))}</div>
-                  <div class="kpi-card"><strong>Working Capital</strong><br>${statementMetrics.workingCapital === null ? 'N/A' : formatMoney(statementMetrics.workingCapital)}</div>
-                  <div class="kpi-card"><strong>Net Income</strong><br>${statementMetrics.netIncome === null ? 'N/A' : formatMoney(statementMetrics.netIncome)}</div>
-                  <div class="kpi-card"><strong>Health Label</strong><br>${escapeHtml(String(statementMetrics.financialHealthLabel ?? 'N/A'))}</div>
-                `
-                : renderUnavailableCard('Statements', services.statementData.reason)
+              ${
+                services.statementData.available && statementMetrics
+                  ? `
+                    <div class="kpi-card"><strong>Current Ratio</strong><br>${escapeHtml(String(statementMetrics.currentRatio ?? 'N/A'))}</div>
+                    <div class="kpi-card"><strong>Working Capital</strong><br>${statementMetrics.workingCapital === null ? 'N/A' : formatMoney(statementMetrics.workingCapital)}</div>
+                    <div class="kpi-card"><strong>Net Income</strong><br>${statementMetrics.netIncome === null ? 'N/A' : formatMoney(statementMetrics.netIncome)}</div>
+                    <div class="kpi-card"><strong>Health Label</strong><br>${escapeHtml(String(statementMetrics.financialHealthLabel ?? 'N/A'))}</div>
+                  `
+                  : renderUnavailableCard('Statements', services.statementData.reason)
+              }
+            </div>
+          </div>
+
+          <div class="panel">
+            <h2>Inventory / COGS Layer</h2>
+            <div class="section-grid">
+              ${
+                services.inventoryData?.available && services.inventoryData?.metrics
+                  ? `
+                    <div class="kpi-card"><strong>Inventory Asset</strong><br>${services.inventoryData.metrics.inventoryAsset === null ? 'N/A' : formatMoney(services.inventoryData.metrics.inventoryAsset)}</div>
+                    <div class="kpi-card"><strong>COGS</strong><br>${services.inventoryData.metrics.cogs === null ? 'N/A' : formatMoney(services.inventoryData.metrics.cogs)}</div>
+                    <div class="kpi-card"><strong>Mismatch Flag</strong><br>${services.inventoryData.metrics.missingCogsSignal ? 'Yes' : 'No'}</div>
+                  `
+                  : renderUnavailableCard('Inventory / COGS', services.inventoryData?.reason || 'Unavailable')
               }
             </div>
           </div>
@@ -1963,14 +2303,15 @@ if (runAI) {
           <div class="panel">
             <h2>Liquidity Layer</h2>
             <div class="section-grid">
-              ${services.bankData.available && bankMetrics
-                ? `
-                  <div class="kpi-card"><strong>Available Cash</strong><br>${formatMoney(bankMetrics.availableCash)}</div>
-                  <div class="kpi-card"><strong>Cash Coverage of Pay Now Bills</strong><br>${escapeHtml(String(bankMetrics.cashCoveragePayNow ?? 'N/A'))}%</div>
-                  <div class="kpi-card"><strong>Cash Coverage of Pay Now + Pay Soon</strong><br>${escapeHtml(String(bankMetrics.cashCoveragePayNowSoon ?? 'N/A'))}%</div>
-                  <div class="kpi-card"><strong>Bank Accounts Found</strong><br>${escapeHtml(String(bankMetrics.bankAccountCount ?? 'N/A'))}</div>
-                `
-                : renderUnavailableCard('Bank / Cash', services.bankData.reason)
+              ${
+                services.bankData.available && bankMetrics
+                  ? `
+                    <div class="kpi-card"><strong>Available Cash</strong><br>${formatMoney(bankMetrics.availableCash)}</div>
+                    <div class="kpi-card"><strong>Cash Coverage of Pay Now Bills</strong><br>${escapeHtml(String(bankMetrics.cashCoveragePayNow ?? 'N/A'))}%</div>
+                    <div class="kpi-card"><strong>Cash Coverage of Pay Now + Pay Soon</strong><br>${escapeHtml(String(bankMetrics.cashCoveragePayNowSoon ?? 'N/A'))}%</div>
+                    <div class="kpi-card"><strong>Bank Accounts Found</strong><br>${escapeHtml(String(bankMetrics.bankAccountCount ?? 'N/A'))}</div>
+                  `
+                  : renderUnavailableCard('Bank / Cash', services.bankData.reason)
               }
             </div>
           </div>
@@ -2024,7 +2365,7 @@ if (runAI) {
               </tbody>
             </table>
           </div>
-<a class="button" href="/bills?refresh=true">Refresh Data</a>
+          <a class="button" href="/bills?refresh=true">Refresh Data</a>
           <a class="button" href="/bills/download">Download CSV</a>
           <a class="button" href="/">Back Home</a>
         </body>
@@ -2033,6 +2374,291 @@ if (runAI) {
   } catch (err) {
     syncStatus = 'Failed';
     res.status(500).send(`<pre>${escapeHtml(err.response?.data ? JSON.stringify(err.response.data, null, 2) : err.message)}</pre>`);
+  }
+});
+
+function buildReadinessChecklist(services, dashboardData) {
+  const issues = [];
+  const checks = [];
+
+  const addCheck = (name, ok, detail) => {
+    checks.push({ name, ok: Boolean(ok), detail });
+    if (!ok) issues.push({ name, detail });
+  };
+
+  addCheck(
+    'QuickBooks connection',
+    Boolean(accessToken && realmId),
+    accessToken && realmId ? 'Connected and authenticated.' : 'QuickBooks is not connected.'
+  );
+
+  addCheck(
+    'AP data available',
+    Array.isArray(dashboardData?.unpaidBills),
+    Array.isArray(dashboardData?.unpaidBills) ? `Loaded ${dashboardData.unpaidBills.length} unpaid bill(s).` : 'Bills not available.'
+  );
+
+  addCheck(
+    'AR data available',
+    Boolean(services?.arData?.available),
+    services?.arData?.available
+      ? `Loaded ${services.arData.metrics?.openCount || 0} open invoice(s).`
+      : services?.arData?.reason || 'AR invoices not available.'
+  );
+
+  addCheck(
+    'Liquidity data available',
+    Boolean(services?.bankData?.available),
+    services?.bankData?.available
+      ? `Loaded ${services.bankData.metrics?.bankAccountCount || 0} bank account(s).`
+      : services?.bankData?.reason || 'Bank data not available.'
+  );
+
+  addCheck(
+    'Financial statements available',
+    Boolean(services?.statementData?.available),
+    services?.statementData?.available
+      ? `Current ratio ${services.statementData.metrics?.currentRatio ?? 'N/A'}.`
+      : services?.statementData?.reason || 'Financial statement data not available.'
+  );
+
+  const inventoryMismatch = Boolean(services?.inventoryData?.metrics?.missingCogsSignal);
+  addCheck(
+    'Inventory / COGS consistency',
+    !inventoryMismatch,
+    inventoryMismatch
+      ? 'Inventory asset exists but COGS is missing or zero. This likely means materials are being posted incorrectly.'
+      : services?.inventoryData?.available
+        ? 'No material inventory/COGS mismatch flag detected.'
+        : services?.inventoryData?.reason || 'Inventory / COGS data not available.'
+  );
+
+  addCheck(
+    'Bill data quality',
+    (dashboardData?.dataQualityCounts?.missingBillNo || 0) === 0 &&
+    (dashboardData?.dataQualityCounts?.missingTerms || 0) === 0,
+    `Missing invoice numbers: ${dashboardData?.dataQualityCounts?.missingBillNo || 0}; missing terms: ${dashboardData?.dataQualityCounts?.missingTerms || 0}.`
+  );
+
+  return {
+    ready: issues.length === 0,
+    issueCount: issues.length,
+    issues,
+    checks,
+  };
+}
+
+function buildOzarkBlueprintPayload(services, dashboardData, alerts) {
+  const unpaidBills = dashboardData.unpaidBills || [];
+  const openInvoices = services?.arData?.openInvoices || [];
+
+  const materialBills = unpaidBills.filter((bill) => bill.vendorCategory === 'Inventory / Materials');
+  const installRelatedBills = unpaidBills.filter((bill) => bill.vendorCategory === 'Maintenance / Repair');
+
+  const apByVendor = unpaidBills.reduce((acc, bill) => {
+    const key = bill.vendorName || 'Unknown';
+    acc[key] = round2((acc[key] || 0) + Number(bill.balance || 0));
+    return acc;
+  }, {});
+
+  const arByCustomer = openInvoices.reduce((acc, inv) => {
+    const key = inv.customerName || 'Unknown';
+    acc[key] = round2((acc[key] || 0) + Number(inv.balance || 0));
+    return acc;
+  }, {});
+
+  const topVendors = Object.entries(apByVendor)
+    .map(([name, balance]) => ({ name, balance }))
+    .sort((a, b) => b.balance - a.balance)
+    .slice(0, 10);
+
+  const topCustomers = Object.entries(arByCustomer)
+    .map(([name, balance]) => ({ name, balance }))
+    .sort((a, b) => b.balance - a.balance)
+    .slice(0, 10);
+
+  const materialsExposure = round2(materialBills.reduce((sum, bill) => sum + Number(bill.balance || 0), 0));
+  const installExposure = round2(installRelatedBills.reduce((sum, bill) => sum + Number(bill.balance || 0), 0));
+
+  const overdueInvoices = openInvoices.filter((inv) => (inv.daysUntilDue ?? 999999) < 0);
+
+  return {
+    companyId: 'client-1',
+    realmId,
+    generatedAt: new Date().toISOString(),
+    overview: {
+      totalAP: dashboardData.kpis?.totalUnpaid || 0,
+      overdueAP: dashboardData.kpis?.overdueAmount || 0,
+      totalAR: services?.arData?.metrics?.totalAR || 0,
+      overdueAR: services?.arData?.metrics?.overdueAR || 0,
+      cash: services?.bankData?.metrics?.availableCash || 0,
+      workingCapital: services?.statementData?.metrics?.workingCapital || 0,
+      currentRatio: services?.statementData?.metrics?.currentRatio || null,
+    },
+    operationsView: {
+      materialSuppliesOutstanding: materialsExposure,
+      installSupportOutstanding: installExposure,
+      materialBillsCount: materialBills.length,
+      installBillsCount: installRelatedBills.length,
+      inventoryCogsMismatch: Boolean(services?.inventoryData?.metrics?.missingCogsSignal),
+    },
+    payables: {
+      actionCounts: dashboardData.actionCounts,
+      vendorConcentrationRisk: dashboardData.kpis?.vendorConcentrationRisk || 'Unknown',
+      topVendors,
+      highestPriorityBills: unpaidBills.slice(0, 15).map((bill) => ({
+        vendor: bill.vendorName,
+        amount: bill.balance,
+        action: bill.recommendedAction,
+        score: bill.priorityScore,
+        category: bill.vendorCategory,
+        dueDate: bill.dueDate,
+        daysUntilDue: bill.daysUntilDue,
+        reason: bill.decisionReason,
+      })),
+    },
+    receivables: {
+      openInvoiceCount: services?.arData?.metrics?.openCount || 0,
+      overdueInvoiceCount: services?.arData?.metrics?.overdueCount || 0,
+      customerConcentration: services?.arData?.metrics?.topCustomers || [],
+      topCustomers,
+      collectionsPriority: overdueInvoices
+        .sort((a, b) => Number(b.balance || 0) - Number(a.balance || 0))
+        .slice(0, 15)
+        .map((inv) => ({
+          customer: inv.customerName,
+          amount: inv.balance,
+          dueDate: inv.dueDate,
+          daysPastDue: Math.abs(inv.daysUntilDue || 0),
+          invoiceNumber: inv.invoiceNo,
+        })),
+    },
+    liquidity: services?.bankData?.metrics || null,
+    financialHealth: services?.statementData?.metrics || null,
+    inventoryDiagnostics: services?.inventoryData?.metrics || null,
+    alerts,
+    readiness: buildReadinessChecklist(services, dashboardData),
+  };
+}
+
+// ======================================================
+// API
+// ======================================================
+
+app.get('/api/health', async (req, res) => {
+  try {
+    const connection = await loadConnection('client-1');
+    res.json({
+      ok: true,
+      quickbooksConnected: Boolean(accessToken && realmId),
+      savedConnection: Boolean(connection),
+      realmId: realmId || connection?.realm_id || null,
+      lastSyncTime,
+      syncStatus,
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/blueprint/summary', async (req, res) => {
+  try {
+    if (!accessToken || !realmId) {
+      return res.status(400).json({ ok: false, error: 'QuickBooks not connected' });
+    }
+
+    const rawBills = await getBillsFromQuickBooks(req.query.refresh === 'true');
+    const services = await buildAllServices(rawBills);
+    const { unpaidBills, kpis, actionCounts, dataQualityCounts } = buildDashboardData(rawBills, services);
+    const alerts = buildAlerts(
+      unpaidBills,
+      kpis,
+      services.paymentData,
+      services.statementData,
+      services.bankData,
+      dataQualityCounts,
+      services.arData,
+      services.inventoryData
+    );
+
+    res.json({
+      ok: true,
+      companyId: 'client-1',
+      realmId,
+      kpis,
+      actionCounts,
+      dataQualityCounts,
+      ap: {
+        unpaidBills: unpaidBills.length,
+        totalUnpaid: kpis.totalUnpaid,
+        overdueAmount: kpis.overdueAmount,
+      },
+      ar: services.arData?.metrics || null,
+      liquidity: services.bankData?.metrics || null,
+      financialHealth: services.statementData?.metrics || null,
+      inventoryDiagnostics: services.inventoryData?.metrics || null,
+      topBills: unpaidBills.slice(0, 10),
+      alerts,
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err.response?.data || err.message,
+    });
+  }
+});
+
+app.get('/api/blueprint/readiness', async (req, res) => {
+  try {
+    if (!accessToken || !realmId) {
+      return res.status(400).json({ ok: false, error: 'QuickBooks not connected' });
+    }
+
+    const rawBills = await getBillsFromQuickBooks(req.query.refresh === 'true');
+    const services = await buildAllServices(rawBills);
+    const dashboardData = buildDashboardData(rawBills, services);
+
+    res.json({
+      ok: true,
+      ...buildReadinessChecklist(services, dashboardData),
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err.response?.data || err.message,
+    });
+  }
+});
+
+app.get('/api/blueprint/ozark', async (req, res) => {
+  try {
+    if (!accessToken || !realmId) {
+      return res.status(400).json({ ok: false, error: 'QuickBooks not connected' });
+    }
+
+    const rawBills = await getBillsFromQuickBooks(req.query.refresh === 'true');
+    const services = await buildAllServices(rawBills);
+    const dashboardData = buildDashboardData(rawBills, services);
+    const alerts = buildAlerts(
+      dashboardData.unpaidBills,
+      dashboardData.kpis,
+      services.paymentData,
+      services.statementData,
+      services.bankData,
+      dashboardData.dataQualityCounts,
+      services.arData,
+      services.inventoryData
+    );
+
+    res.json({
+      ok: true,
+      blueprint: buildOzarkBlueprintPayload(services, dashboardData, alerts),
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err.response?.data || err.message,
+    });
   }
 });
 
@@ -2046,8 +2672,8 @@ app.get('/bills/download', async (req, res) => {
       return res.status(400).send('Not connected to QuickBooks.');
     }
 
-const forceRefresh = req.query.refresh === 'true';
-const rawBills = await getBillsFromQuickBooks(forceRefresh);
+    const forceRefresh = req.query.refresh === 'true';
+    const rawBills = await getBillsFromQuickBooks(forceRefresh);
     const services = await buildAllServices(rawBills);
     const { unpaidBills } = buildDashboardData(rawBills, services);
 
@@ -2141,10 +2767,24 @@ const rawBills = await getBillsFromQuickBooks(forceRefresh);
 // ======================================================
 // SERVER
 // ======================================================
+
 app.get('/test', (req, res) => {
   res.send('Server works');
 });
+
+function startDailyAutomation() {
+  const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+
+  setInterval(async () => {
+    await runAutomatedDailySnapshot();
+  }, ONE_DAY_MS);
+
+  console.log('Daily automation scheduler started');
+}
+
 app.listen(PORT, async () => {
   console.log(`Server running on port ${PORT}`);
   await initDB();
+  await hydrateDefaultConnection();
+  startDailyAutomation();
 });
