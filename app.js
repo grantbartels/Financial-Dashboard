@@ -2377,6 +2377,7 @@ app.get('/bills', async (req, res) => {
   }
 });
 
+
 function buildReadinessChecklist(services, dashboardData) {
   const issues = [];
   const checks = [];
@@ -2395,7 +2396,9 @@ function buildReadinessChecklist(services, dashboardData) {
   addCheck(
     'AP data available',
     Array.isArray(dashboardData?.unpaidBills),
-    Array.isArray(dashboardData?.unpaidBills) ? `Loaded ${dashboardData.unpaidBills.length} unpaid bill(s).` : 'Bills not available.'
+    Array.isArray(dashboardData?.unpaidBills)
+      ? `Loaded ${dashboardData.unpaidBills.length} unpaid bill(s).`
+      : 'Bills not available.'
   );
 
   addCheck(
@@ -2427,17 +2430,17 @@ function buildReadinessChecklist(services, dashboardData) {
     'Inventory / COGS consistency',
     !inventoryMismatch,
     inventoryMismatch
-      ? 'Inventory asset exists but COGS is missing or zero. This likely means materials are being posted incorrectly.'
+      ? 'Inventory asset exists but COGS is missing or zero. Materials may be posted incorrectly.'
       : services?.inventoryData?.available
-        ? 'No material inventory/COGS mismatch flag detected.'
+        ? 'No inventory / COGS mismatch flag detected.'
         : services?.inventoryData?.reason || 'Inventory / COGS data not available.'
   );
 
   addCheck(
     'Bill data quality',
-    (dashboardData?.dataQualityCounts?.missingBillNo || 0) === 0 &&
+    (dashboardData?.dataQualityCounts?.missingInvoiceNumber || 0) === 0 &&
     (dashboardData?.dataQualityCounts?.missingTerms || 0) === 0,
-    `Missing invoice numbers: ${dashboardData?.dataQualityCounts?.missingBillNo || 0}; missing terms: ${dashboardData?.dataQualityCounts?.missingTerms || 0}.`
+    `Missing invoice numbers: ${dashboardData?.dataQualityCounts?.missingInvoiceNumber || 0}; missing terms: ${dashboardData?.dataQualityCounts?.missingTerms || 0}.`
   );
 
   return {
@@ -2449,11 +2452,18 @@ function buildReadinessChecklist(services, dashboardData) {
 }
 
 function buildOzarkBlueprintPayload(services, dashboardData, alerts) {
-  const unpaidBills = dashboardData.unpaidBills || [];
+  const unpaidBills = dashboardData?.unpaidBills || [];
   const openInvoices = services?.arData?.openInvoices || [];
 
-  const materialBills = unpaidBills.filter((bill) => bill.vendorCategory === 'Inventory / Materials');
-  const installRelatedBills = unpaidBills.filter((bill) => bill.vendorCategory === 'Maintenance / Repair');
+  const materialBills = unpaidBills.filter((bill) =>
+    ['Inventory / Materials', 'Glass Supplier', 'Hardware Supplier'].includes(bill.vendorCategory)
+  );
+
+  const installRelatedBills = unpaidBills.filter((bill) =>
+    ['Maintenance / Repair', 'Payroll Related', 'Subcontract Installer'].includes(bill.vendorCategory)
+  );
+
+  const overdueInvoices = openInvoices.filter((inv) => inv.isOverdue);
 
   const apByVendor = unpaidBills.reduce((acc, bill) => {
     const key = bill.vendorName || 'Unknown';
@@ -2462,39 +2472,43 @@ function buildOzarkBlueprintPayload(services, dashboardData, alerts) {
   }, {});
 
   const arByCustomer = openInvoices.reduce((acc, inv) => {
-    const key = inv.customerName || 'Unknown';
+    const key = inv.customerName || 'Unknown Customer';
     acc[key] = round2((acc[key] || 0) + Number(inv.balance || 0));
     return acc;
   }, {});
 
   const topVendors = Object.entries(apByVendor)
-    .map(([name, balance]) => ({ name, balance }))
-    .sort((a, b) => b.balance - a.balance)
+    .map(([vendor, amount]) => ({ vendor, amount }))
+    .sort((a, b) => b.amount - a.amount)
     .slice(0, 10);
 
   const topCustomers = Object.entries(arByCustomer)
-    .map(([name, balance]) => ({ name, balance }))
-    .sort((a, b) => b.balance - a.balance)
+    .map(([customer, amount]) => ({ customer, amount }))
+    .sort((a, b) => b.amount - a.amount)
     .slice(0, 10);
 
-  const materialsExposure = round2(materialBills.reduce((sum, bill) => sum + Number(bill.balance || 0), 0));
-  const installExposure = round2(installRelatedBills.reduce((sum, bill) => sum + Number(bill.balance || 0), 0));
+  const materialsExposure = round2(
+    materialBills.reduce((sum, bill) => sum + Number(bill.balance || 0), 0)
+  );
 
-  const overdueInvoices = openInvoices.filter((inv) => (inv.daysUntilDue ?? 999999) < 0);
+  const installExposure = round2(
+    installRelatedBills.reduce((sum, bill) => sum + Number(bill.balance || 0), 0)
+  );
 
   return {
-    companyId: 'client-1',
-    realmId,
+    company: 'Ozarks Mountain Glass',
     generatedAt: new Date().toISOString(),
-    overview: {
-      totalAP: dashboardData.kpis?.totalUnpaid || 0,
-      overdueAP: dashboardData.kpis?.overdueAmount || 0,
+
+    financialView: {
+      totalAP: dashboardData?.kpis?.totalUnpaid || 0,
+      overdueAP: dashboardData?.kpis?.overdueAmount || 0,
       totalAR: services?.arData?.metrics?.totalAR || 0,
       overdueAR: services?.arData?.metrics?.overdueAR || 0,
       cash: services?.bankData?.metrics?.availableCash || 0,
       workingCapital: services?.statementData?.metrics?.workingCapital || 0,
       currentRatio: services?.statementData?.metrics?.currentRatio || null,
     },
+
     operationsView: {
       materialSuppliesOutstanding: materialsExposure,
       installSupportOutstanding: installExposure,
@@ -2502,9 +2516,10 @@ function buildOzarkBlueprintPayload(services, dashboardData, alerts) {
       installBillsCount: installRelatedBills.length,
       inventoryCogsMismatch: Boolean(services?.inventoryData?.metrics?.missingCogsSignal),
     },
+
     payables: {
-      actionCounts: dashboardData.actionCounts,
-      vendorConcentrationRisk: dashboardData.kpis?.vendorConcentrationRisk || 'Unknown',
+      actionCounts: dashboardData?.actionCounts || null,
+      vendorConcentrationRisk: dashboardData?.kpis?.vendorConcentrationRisk || 'Unknown',
       topVendors,
       highestPriorityBills: unpaidBills.slice(0, 15).map((bill) => ({
         vendor: bill.vendorName,
@@ -2517,6 +2532,7 @@ function buildOzarkBlueprintPayload(services, dashboardData, alerts) {
         reason: bill.decisionReason,
       })),
     },
+
     receivables: {
       openInvoiceCount: services?.arData?.metrics?.openCount || 0,
       overdueInvoiceCount: services?.arData?.metrics?.overdueCount || 0,
@@ -2533,6 +2549,7 @@ function buildOzarkBlueprintPayload(services, dashboardData, alerts) {
           invoiceNumber: inv.invoiceNo,
         })),
     },
+
     liquidity: services?.bankData?.metrics || null,
     financialHealth: services?.statementData?.metrics || null,
     inventoryDiagnostics: services?.inventoryData?.metrics || null,
@@ -2581,6 +2598,12 @@ app.get('/api/blueprint/summary', async (req, res) => {
       services.inventoryData
     );
 
+const dashboardData = { unpaidBills, kpis, actionCounts, dataQualityCounts };
+
+const readiness = buildReadinessChecklist(services, dashboardData);
+
+const blueprint = buildOzarkBlueprintPayload(services, dashboardData, alerts);
+
     res.json({
       ok: true,
       companyId: 'client-1',
@@ -2599,6 +2622,9 @@ app.get('/api/blueprint/summary', async (req, res) => {
       inventoryDiagnostics: services.inventoryData?.metrics || null,
       topBills: unpaidBills.slice(0, 10),
       alerts,
+     
+      readiness,
+blueprint,
     });
   } catch (err) {
     res.status(500).json({
