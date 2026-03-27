@@ -1983,6 +1983,9 @@ app.get('/bills', async (req, res) => {
       `);
     }
 
+
+
+
     const forceRefresh = req.query.refresh === 'true';
     const rawBills = await getBillsFromQuickBooks(forceRefresh);
     lastSyncTime = new Date();
@@ -2001,7 +2004,61 @@ app.get('/bills', async (req, res) => {
       services.inventoryData
     );
 
-    const currentSnapshot = buildHistoricalSnapshot(unpaidBills, kpis, actionCounts, services.arData?.metrics);
+const dashboardData = { unpaidBills, kpis, actionCounts, dataQualityCounts };
+const readiness = buildReadinessChecklist(services, dashboardData);
+const blueprint = buildOzarkBlueprintPayload(services, dashboardData, alerts);
+
+// 🔥 ADD THIS HERE
+const readinessHtml = `
+  <div class="section-card">
+    <h2>System Readiness</h2>
+    <div class="mini-grid">
+      ${(readiness.checks || []).map((check) => `
+        <div class="mini-card">
+          <div><strong>${escapeHtml(check.name)}</strong></div>
+          <div class="${check.ok ? 'ok' : 'bad'}">${check.ok ? 'Ready' : 'Issue'}</div>
+          <div class="muted">${escapeHtml(check.detail || '')}</div>
+        </div>
+      `).join('')}
+    </div>
+  </div>
+`;
+
+const blueprintHtml = `
+  <div class="section-card">
+    <h2>Ozark Blueprint</h2>
+    <div class="blueprint-grid">
+      <div class="mini-card">
+        <h3>Financial View</h3>
+        <p><strong>AP Outstanding:</strong> ${formatMoney(blueprint.financialView?.apOutstanding || 0)}</p>
+        <p><strong>AR Outstanding:</strong> ${formatMoney(blueprint.financialView?.arOutstanding || 0)}</p>
+        <p><strong>Cash:</strong> ${formatMoney(blueprint.financialView?.cash || 0)}</p>
+        <p><strong>Working Capital:</strong> ${formatMoney(blueprint.financialView?.workingCapital || 0)}</p>
+        <p><strong>Current Ratio:</strong> ${blueprint.financialView?.currentRatio ?? 'N/A'}</p>
+      </div>
+
+      <div class="mini-card">
+        <h3>Operations View</h3>
+        <p><strong>Material / Supply Outstanding:</strong> ${formatMoney(blueprint.operationsView?.materialSuppliesOutstanding || 0)}</p>
+        <p><strong>Install / Support Outstanding:</strong> ${formatMoney(blueprint.operationsView?.installSupportOutstanding || 0)}</p>
+        <p><strong>Material Bills Count:</strong> ${blueprint.operationsView?.materialBillsCount || 0}</p>
+        <p><strong>Install Bills Count:</strong> ${blueprint.operationsView?.installBillsCount || 0}</p>
+        <p><strong>Inventory / COGS Mismatch:</strong> ${formatBoolean(blueprint.operationsView?.inventoryCogsMismatch)}</p>
+      </div>
+
+      <div class="mini-card">
+        <h3>Receivables / Payables</h3>
+        <p><strong>Vendor Concentration Risk:</strong> ${escapeHtml(blueprint.payables?.vendorConcentrationRisk || 'Unknown')}</p>
+        <p><strong>Open Invoices:</strong> ${blueprint.receivables?.openInvoiceCount || 0}</p>
+        <p><strong>Overdue Invoices:</strong> ${blueprint.receivables?.overdueInvoiceCount || 0}</p>
+        <p><strong>Pay Now:</strong> ${blueprint.payables?.actionCounts?.payNow || 0}</p>
+        <p><strong>Pay Soon:</strong> ${blueprint.payables?.actionCounts?.paySoon || 0}</p>
+      </div>
+    </div>
+  </div>
+`;
+
+const currentSnapshot = buildHistoricalSnapshot(unpaidBills, kpis, actionCounts, services.arData?.metrics);
 
     await saveSnapshot({
       companyId: 'client-1',
@@ -2324,7 +2381,8 @@ app.get('/bills', async (req, res) => {
               <div class="kpi-card"><strong>Review Bucket</strong><br>${actionCounts.review}</div>
             </div>
           </div>
-
+${readinessHtml}
+${blueprintHtml}
           <div class="table-wrap">
             <table>
               <thead>
