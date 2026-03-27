@@ -1,3 +1,4 @@
+console.log("🔥 DEPLOY TEST - GRANT");
 require('dotenv').config();
 console.log('OpenAI key loaded:', !!process.env.OPENAI_API_KEY);
 const express = require('express');
