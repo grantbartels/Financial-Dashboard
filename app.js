@@ -1,4 +1,3 @@
-// updated
 require('dotenv').config();
 console.log('OpenAI key loaded:', !!process.env.OPENAI_API_KEY);
 const express = require('express');
@@ -394,7 +393,14 @@ async function persistCompanyMemory({
       summaryText: aiSummary,
     });
   }
-
+await saveSnapshot({
+  companyId,
+  totalAP: kpis.totalUnpaid,
+  overdueAP: kpis.overdueAmount,
+  totalAR: services.arData?.metrics?.totalAR,
+  overdueAR: services.arData?.metrics?.overdueAR,
+  cash: services.bankData?.metrics?.availableCash
+});
   return syncRunId;
 }
 
@@ -3398,6 +3404,32 @@ function startSnapshotScheduler() {
 
 app.get('/test', (req, res) => {
   res.send('Server works');
+});
+
+app.get("/timeline/:company_id", async (req, res) => {
+  try {
+    const { company_id } = req.params;
+
+    const result = await pool.query(
+      `SELECT 
+        company_id,
+        total_ap,
+        overdue_ap,
+        total_ar,
+        overdue_ar,
+        cash_balance,
+        created_at
+       FROM dashboard_snapshots
+       WHERE company_id = $1
+       ORDER BY created_at ASC`,
+      [company_id]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error("Error fetching timeline:", err.message);
+    res.status(500).json({ error: "Failed to fetch timeline" });
+  }
 });
 
 app.listen(PORT, async () => {
