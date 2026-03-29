@@ -2640,9 +2640,6 @@ const blueprintHtml = `
   unpaidBillsCount: unpaidBills.length || 0,
 });
 
-const startDate = req.query.startDate || null;
-const endDate = req.query.endDate || null;
-
 const historicalComparisons = await getHistoricalComparisonsFromDb(
   'client-1',
   startDate,
