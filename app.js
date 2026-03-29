@@ -499,6 +499,11 @@ const CONFIG = {
     mediumCashCoverage: 8,
     abnormalAmount: 12,
   },
+
+  defaults: {
+  terms: 'Net 30',
+  uncategorizedLabel: 'Uncategorized',
+},
   actionCutoffs: {
     payNowMin: 75,
     paySoonMin: 40,
@@ -901,7 +906,8 @@ function buildOpenInvoices(rawInvoices = []) {
     .map(normalizeQuickBooksInvoice)
     .filter((invoice) => Number(invoice.Balance || 0) > 0)
     .map((invoice) => {
-      const daysUntilDue = getDaysUntilDue(invoice.DueDate);
+     const timeDiffs = getTimeDiffs(invoice.DueDate);
+const daysUntilDue = timeDiffs.daysUntilDue;
       return {
         invoiceId: safeText(invoice.Id),
         customerName: safeText(invoice.CustomerRef?.name, 'Unknown Customer'),
@@ -1288,11 +1294,56 @@ function getLocationClass(bill) {
 }
 
 function getMemo(bill) {
-  return safeText(bill.PrivateNote || bill.Memo);
+  const value = bill.PrivateNote || bill.Memo || null;
+  return value && String(value).trim() ? String(value).trim() : null;
 }
 
 function getTerms(bill) {
-  return safeText(bill.SalesTermRef?.name || bill.TermRef?.name);
+  const value = bill.SalesTermRef?.name || bill.TermRef?.name || null;
+  return value && String(value).trim() ? String(value).trim() : null;
+}
+
+function buildAutoMemo({ vendorName, categorySummary, account }) {
+  const vendor = !isMissingText(vendorName) ? vendorName : 'Unknown Vendor';
+  const category =
+    !isMissingText(categorySummary) && categorySummary !== 'N/A'
+      ? categorySummary
+      : !isMissingText(account) && account !== 'N/A'
+        ? account
+        : CONFIG.defaults.uncategorizedLabel;
+
+  return `${vendor} - ${category}`;
+}
+
+function applyBillDataQualityDefaults(baseBill) {
+  const wasMissingInvoiceNumber = isMissingText(baseBill.billNo);
+  const wasMissingTerms = isMissingText(baseBill.terms);
+  const wasMissingMemo = isMissingText(baseBill.memo);
+
+  return {
+    ...baseBill,
+    rawBillNo: baseBill.billNo,
+    rawTerms: baseBill.terms,
+    rawMemo: baseBill.memo,
+
+    billNo: baseBill.billNo || null,
+
+    terms: wasMissingTerms
+      ? CONFIG.defaults.terms
+      : baseBill.terms,
+
+    memo: wasMissingMemo
+      ? buildAutoMemo({
+          vendorName: baseBill.vendorName,
+          categorySummary: baseBill.categorySummary,
+          account: baseBill.account,
+        })
+      : baseBill.memo,
+
+    wasMissingInvoiceNumber,
+    wasMissingTerms,
+    wasMissingMemo,
+  };
 }
 
 // ======================================================
@@ -1341,10 +1392,27 @@ function normalizeQuickBooksBills(rawBills = []) {
   return rawBills.map(normalizeQuickBooksBill);
 }
 
+function getTimeDiffs(dueDate) {
+  if (!dueDate) return {};
+
+  const now = new Date();
+  const due = new Date(dueDate);
+  const diffMs = due - now;
+
+  return {
+    hoursUntilDue: Math.floor(diffMs / (1000 * 60 * 60)),
+    daysUntilDue: Math.floor(diffMs / (1000 * 60 * 60 * 24)),
+    weeksUntilDue: Math.floor(diffMs / (1000 * 60 * 60 * 24 * 7)),
+    monthsUntilDue: Math.floor(diffMs / (1000 * 60 * 60 * 24 * 30)),
+  };
+}
+
 function buildBaseProcessedBills(rawBills) {
   return rawBills.map((bill) => {
     const billId = safeText(bill.Id);
-    const billNo = safeText(bill.DocNumber);
+    const billNo = bill.DocNumber && String(bill.DocNumber).trim()
+  ? String(bill.DocNumber).trim()
+  : null;
     const vendorId = safeText(bill.VendorRef?.value);
     const vendorName = safeText(bill.VendorRef?.name, 'Unknown Vendor');
     const billDate = safeText(bill.TxnDate);
@@ -1361,7 +1429,8 @@ function buildBaseProcessedBills(rawBills) {
     const categorySummary = getCategorySummary(bill.Line);
     const account = getPrimaryAccount(bill.Line);
     const locationClass = getLocationClass(bill);
-    const daysUntilDue = getDaysUntilDue(dueDate);
+    const timeDiffs = getTimeDiffs(dueDate);
+const daysUntilDue = timeDiffs.daysUntilDue;
     const isOverdue = daysUntilDue !== null && daysUntilDue < 0;
     const agingBucket = getAgingBucket(daysUntilDue);
     const amountBucket = getAmountBucket(originalAmount);
@@ -1373,35 +1442,40 @@ function buildBaseProcessedBills(rawBills) {
     });
     const isCriticalVendor = isCriticalVendorCategory(vendorCategory);
 
-    return {
-      billId,
-      billNo,
-      vendorId,
-      vendorName,
-      vendorCategory,
-      isCriticalVendor,
-      billDate,
-      dueDate,
-      createdAt,
-      lastUpdated,
-      originalAmount,
-      balance,
-      amountPaid,
-      currency,
-      paymentStatus: getPaymentStatus(balance, originalAmount),
-      terms,
-      memo,
-      categorySummary,
-      account,
-      locationClass,
-      daysUntilDue,
-      isOverdue,
-      agingBucket,
-      amountBucket,
-      dueIn3Days: daysUntilDue !== null && daysUntilDue >= 0 && daysUntilDue <= CONFIG.thresholds.dueSoonDays,
-      dueIn7Days: daysUntilDue !== null && daysUntilDue >= 0 && daysUntilDue <= CONFIG.thresholds.dueWeekDays,
-      dueIn14Days: daysUntilDue !== null && daysUntilDue >= 0 && daysUntilDue <= CONFIG.thresholds.due14Days,
-    };
+    const baseBill = {
+  billId,
+  billNo,
+  vendorId,
+  vendorName,
+  vendorCategory,
+  isCriticalVendor,
+  billDate,
+  dueDate,
+  createdAt,
+  lastUpdated,
+  originalAmount,
+  balance,
+  amountPaid,
+  currency,
+  paymentStatus: getPaymentStatus(balance, originalAmount),
+  terms,
+  memo,
+  categorySummary,
+  account,
+  locationClass,
+daysUntilDue,
+hoursUntilDue: timeDiffs.hoursUntilDue,
+weeksUntilDue: timeDiffs.weeksUntilDue,
+monthsUntilDue: timeDiffs.monthsUntilDue,
+isOverdue,
+agingBucket,
+amountBucket,
+  dueIn3Days: daysUntilDue !== null && daysUntilDue >= 0 && daysUntilDue <= CONFIG.thresholds.dueSoonDays,
+  dueIn7Days: daysUntilDue !== null && daysUntilDue >= 0 && daysUntilDue <= CONFIG.thresholds.dueWeekDays,
+  dueIn14Days: daysUntilDue !== null && daysUntilDue >= 0 && daysUntilDue <= CONFIG.thresholds.due14Days,
+};
+
+return applyBillDataQualityDefaults(baseBill);
   });
 }
 
@@ -1522,21 +1596,21 @@ function applyRulesToBill(bill, context) {
     addScore(CONFIG.weights.criticalVendor, `Critical vendor category: ${bill.vendorCategory}`);
   }
 
-  if (isMissingText(bill.billNo)) {
-    addScore(CONFIG.weights.missingBillNo, 'Missing invoice number', 'data');
-  }
+ if (bill.wasMissingInvoiceNumber) {
+  addScore(CONFIG.weights.missingBillNo, 'Missing invoice number', 'data');
+}
 
-  if (!bill.dueDate) {
-    addScore(CONFIG.weights.missingDueDate, 'Missing due date', 'data');
-  }
+if (!bill.dueDate) {
+  addScore(CONFIG.weights.missingDueDate, 'Missing due date', 'data');
+}
 
-  if (isMissingText(bill.memo)) {
-    addScore(CONFIG.weights.missingMemo, 'Missing memo', 'data');
-  }
+if (bill.wasMissingMemo) {
+  addScore(CONFIG.weights.missingMemo, 'Missing memo', 'data');
+}
 
-  if (isMissingText(bill.terms)) {
-    addScore(CONFIG.weights.missingTerms, 'Missing terms', 'data');
-  }
+if (bill.wasMissingTerms) {
+  addScore(CONFIG.weights.missingTerms, 'Missing terms', 'data');
+}
 
   if (duplicateWarnings.length) {
     addScore(CONFIG.weights.duplicateSuspected, 'Possible duplicate detected', 'anomaly');
@@ -2160,12 +2234,7 @@ function getSystemStageLabel() {
   return 'Step 9 Finance Blueprint';
 }
 
-async function runAutomatedDailySnapshot() {
-  try {
-    if (!accessToken || !realmId) {
-      console.log('Daily automation skipped: QuickBooks not connected');
-      return;
-    }
+
 
     console.log('Running daily automated snapshot...');
 
@@ -3239,6 +3308,115 @@ app.get('/bills/download', async (req, res) => {
 });
 
 // ======================================================
+// SNAPSHOT SCHEDULER
+// ======================================================
+
+function getCentralTimeParts(date = new Date()) {
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Chicago',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+
+  const parts = formatter.formatToParts(date);
+  const map = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+
+  return {
+    year: Number(map.year),
+    month: Number(map.month),
+    day: Number(map.day),
+    hour: Number(map.hour),
+    minute: Number(map.minute),
+  };
+}
+
+function getNextSnapshotTime() {
+  const now = new Date();
+  const { year, month, day, hour, minute } = getCentralTimeParts(now);
+
+  const scheduledHours = [8, 12, 16, 20];
+
+  let nextHour = scheduledHours.find(
+    (h) => h > hour || (h === hour && minute < 1)
+  );
+
+  const nextDate = new Date();
+
+  if (nextHour === undefined) {
+    nextHour = 8;
+    nextDate.setDate(nextDate.getDate() + 1);
+  }
+
+  nextDate.setHours(nextHour, 0, 0, 0);
+
+  return nextDate;
+}
+
+async function runAutomatedSnapshot() {
+  try {
+    console.log('Running scheduled snapshot...');
+
+    const rawBills = await getBillsFromQuickBooks(true);
+    const services = await buildAllServices(rawBills);
+
+    const { unpaidBills, kpis, actionCounts } =
+      buildDashboardData(rawBills, services);
+
+    const snapshot = buildHistoricalSnapshot(
+      unpaidBills,
+      kpis,
+      actionCounts,
+      services.arData?.metrics || null
+    );
+
+    recordDashboardSnapshot(snapshot);
+
+    await saveSnapshot({
+      companyId: 'client-1',
+      totalAP: kpis.totalUnpaid,
+      overdueAP: kpis.overdueAmount,
+      totalAR: services.arData?.metrics?.totalAR || 0,
+      overdueAR: services.arData?.metrics?.overdueAR || 0,
+      cash: services.bankData?.metrics?.availableCash || 0,
+    });
+
+    console.log('Snapshot saved');
+  } catch (err) {
+    console.error('runAutomatedSnapshot error:', err.message);
+  }
+}
+
+function startSnapshotScheduler() {
+  async function scheduleNext() {
+    const nextTime = getNextSnapshotTime();
+    const delay = Math.max(nextTime - new Date(), 0);
+
+    console.log(
+      `Next snapshot scheduled at ${nextTime.toLocaleString('en-US', {
+        timeZone: 'America/Chicago',
+      })}`
+    );
+
+    setTimeout(async () => {
+      try {
+        await runAutomatedSnapshot();
+        console.log('Snapshot run complete');
+      } catch (err) {
+        console.error('Snapshot failed:', err.message);
+      }
+
+      scheduleNext();
+    }, delay);
+  }
+
+  scheduleNext();
+}
+
+// ======================================================
 // SERVER
 // ======================================================
 
@@ -3246,21 +3424,13 @@ app.get('/test', (req, res) => {
   res.send('Server works');
 });
 
-function startDailyAutomation() {
-  const ONE_DAY_MS = 24 * 60 * 60 * 1000;
-
-  setInterval(async () => {
-    await runAutomatedDailySnapshot();
-  }, ONE_DAY_MS);
-
-  console.log('Daily automation scheduler started');
-}
-
 app.listen(PORT, async () => {
   console.log(`Server running on port ${PORT}`);
+
   await initDB();
   await hydrateDefaultConnection();
-  startDailyAutomation();
+
+  startSnapshotScheduler();
 });
 
 // ======================================================
