@@ -36,6 +36,11 @@ async function initDB() {
     );
   `);
 
+await pool.query(`
+  ALTER TABLE dashboard_snapshots
+  ADD COLUMN IF NOT EXISTS overdue_ar NUMERIC DEFAULT 0;
+`);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS qb_connections (
       company_id TEXT PRIMARY KEY,
