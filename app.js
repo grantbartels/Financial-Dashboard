@@ -2026,42 +2026,18 @@ async function generateAiSummary({ unpaidBills, kpis, actionCounts, alerts, serv
       return 'AI summary unavailable: OPENAI_API_KEY missing.';
     }
 
-    const topBills = unpaidBills.slice(0, 10).map((bill) => ({
-  vendor: bill.vendorName,
-  category: bill.vendorCategory,
-  balance: bill.balance,
-  action: bill.recommendedAction,
-  risk: bill.riskLevel,
-  score: bill.priorityScore,
-  reason: bill.decisionReason,
-  dueDate: bill.dueDate,
-  daysUntilDue: bill.daysUntilDue,
-  overdue: bill.isOverdue,
-  urgencyDrivers: bill.urgencyDrivers || [],
-  anomalyFlags: bill.anomalyFlags || [],
-  dataQualityFlags: bill.dataQualityFlags || [],
-  explanationText: bill.explanationText || '',
-  ruleHits: (bill.ruleHits || []).map((hit) => ({
-    label: hit.label,
-    points: hit.points,
-    group: hit.group,
-  })),
-}));
-
-const billSample = unpaidBills.slice(0, 25).map((bill) => ({
-  vendor: bill.vendorName,
-  balance: bill.balance,
-  action: bill.recommendedAction,
-  score: bill.priorityScore,
-  dueDate: bill.dueDate,
-  daysUntilDue: bill.daysUntilDue,
-  overdue: bill.isOverdue,
-  category: bill.vendorCategory,
-  reason: bill.decisionReason,
-  urgencyDrivers: bill.urgencyDrivers || [],
-  anomalyFlags: bill.anomalyFlags || [],
-  dataQualityFlags: bill.dataQualityFlags || [],
-}));
+    const topBills = unpaidBills.slice(0, 5).map((bill) => ({
+      vendor: bill.vendorName,
+      category: bill.vendorCategory,
+      balance: bill.balance,
+      action: bill.recommendedAction,
+      risk: bill.riskLevel,
+      score: bill.priorityScore,
+      reason: bill.decisionReason,
+      dueDate: bill.dueDate,
+      daysUntilDue: bill.daysUntilDue,
+      overdue: bill.isOverdue,
+    }));
 
     const payload = {
       summary: {
@@ -2082,57 +2058,23 @@ const billSample = unpaidBills.slice(0, 25).map((bill) => ({
       financialHealth: services.statementData?.metrics || null,
       liquidity: services.bankData?.metrics || null,
       paymentBehavior: services.paymentData?.metrics || null,
-      billSample,
-  fullActionBreakdown: {
-    payNow: unpaidBills.filter((b) => b.recommendedAction === 'Pay Now').map((b) => ({
-      vendor: b.vendorName,
-      balance: b.balance,
-      score: b.priorityScore,
-      reason: b.decisionReason,
-    })),
-    paySoon: unpaidBills.filter((b) => b.recommendedAction === 'Pay Soon').map((b) => ({
-      vendor: b.vendorName,
-      balance: b.balance,
-      score: b.priorityScore,
-      reason: b.decisionReason,
-    })),
-    review: unpaidBills.filter((b) => b.recommendedAction === 'Review').map((b) => ({
-      vendor: b.vendorName,
-      balance: b.balance,
-      score: b.priorityScore,
-      reason: b.decisionReason,
-    })),
-  },
-  arDetails: services.arData?.metrics || null,
-  inventoryDetails: services.inventoryData?.metrics || null,
-
-  // existing
-  financialHealth: services.statementData?.metrics || null,
-  liquidity: services.bankData?.metrics || null,
-  paymentBehavior: services.paymentData?.metrics || null
-};
     };
 
     const prompt = `
-You are a finance operations assistant for a small business dashboard.
+You are a finance operations assistant.
 
-Analyze the data and output these sections:
+Analyze this accounts payable data and output:
 
 1. Executive Summary
 2. Top 3 Risks
 3. Top 3 Actions
 4. Cash Flow Warning (if needed)
-5. What Management Should Watch This Week
 
 Rules:
 - Be concise
 - Be practical
 - No fluff
-- Only use the provided data
-- Use bill-level reasons, urgency drivers, anomaly flags, and data quality flags when explaining recommendations
-- Focus on operational impact
-- If a bill is Pay Now or Pay Soon, explain WHY using the rule logic
-- Mention AR, cash, concentration risk, and overdue exposure when relevant
+- Only use given data
 
 Data:
 ${JSON.stringify(payload, null, 2)}
