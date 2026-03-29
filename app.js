@@ -3338,13 +3338,14 @@ function getNextSnapshotTime() {
   const now = new Date();
   const { year, month, day, hour, minute } = getCentralTimeParts(now);
 
-  const scheduledHours = [8, 12, 16, 20];
+  const currentDate = new Date(year, month - 1, day, hour, minute, 0, 0);
 
+  const scheduledHours = [8, 12, 16, 20];
   let nextHour = scheduledHours.find(
     (h) => h > hour || (h === hour && minute < 1)
   );
 
-  const nextDate = new Date();
+  const nextDate = new Date(currentDate);
 
   if (nextHour === undefined) {
     nextHour = 8;
@@ -3352,7 +3353,6 @@ function getNextSnapshotTime() {
   }
 
   nextDate.setHours(nextHour, 0, 0, 0);
-
   return nextDate;
 }
 
