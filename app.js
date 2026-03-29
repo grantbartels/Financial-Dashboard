@@ -47,6 +47,96 @@ async function initDB() {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
   `);
+    await pool.query(`
+    CREATE TABLE IF NOT EXISTS companies (
+      company_id TEXT PRIMARY KEY,
+      company_name TEXT,
+      realm_id TEXT,
+      industry TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS qb_sync_runs (
+      id SERIAL PRIMARY KEY,
+      company_id TEXT,
+      synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS qb_kpi_snapshots (
+      id SERIAL PRIMARY KEY,
+      sync_run_id INTEGER,
+      company_id TEXT,
+      total_ap NUMERIC,
+      overdue_ap NUMERIC,
+      total_ar NUMERIC,
+      overdue_ar NUMERIC,
+      cash_balance NUMERIC,
+      working_capital NUMERIC,
+      current_ratio NUMERIC,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS qb_bill_facts (
+      id SERIAL PRIMARY KEY,
+      sync_run_id INTEGER,
+      company_id TEXT,
+      bill_id TEXT,
+      vendor_name TEXT,
+      bill_no TEXT,
+      bill_date DATE,
+      due_date DATE,
+      balance NUMERIC,
+      total_amount NUMERIC,
+      priority_score INTEGER,
+      recommended_action TEXT,
+      risk_level TEXT,
+      decision_reason TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS qb_invoice_facts (
+      id SERIAL PRIMARY KEY,
+      sync_run_id INTEGER,
+      company_id TEXT,
+      invoice_id TEXT,
+      customer_name TEXT,
+      balance NUMERIC,
+      total_amount NUMERIC,
+      due_date DATE,
+      is_overdue BOOLEAN,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS qb_account_facts (
+      id SERIAL PRIMARY KEY,
+      sync_run_id INTEGER,
+      company_id TEXT,
+      account_name TEXT,
+      account_type TEXT,
+      balance NUMERIC,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS company_ai_summaries (
+      id SERIAL PRIMARY KEY,
+      sync_run_id INTEGER,
+      company_id TEXT,
+      summary_text TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
 }
 
 async function saveSnapshot(data) {
@@ -121,6 +211,190 @@ async function saveConnection(data) {
       data.refreshExpiresAt,
     ]
   );
+}
+
+async function ensureCompany(data) {
+  await pool.query(
+    `INSERT INTO companies (company_id, company_name, realm_id, industry)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (company_id)
+     DO UPDATE SET
+       company_name = EXCLUDED.company_name,
+       realm_id = EXCLUDED.realm_id,
+       industry = EXCLUDED.industry`,
+    [
+      data.companyId,
+      data.companyName || null,
+      data.realmId || null,
+      data.industry || null,
+    ]
+  );
+}
+
+async function createSyncRun({ companyId }) {
+  const result = await pool.query(
+    `INSERT INTO qb_sync_runs (company_id)
+     VALUES ($1)
+     RETURNING id`,
+    [companyId]
+  );
+
+  return result.rows[0].id;
+}
+
+async function saveKpiSnapshot({ syncRunId, companyId, kpis, services }) {
+  await pool.query(
+    `INSERT INTO qb_kpi_snapshots (
+      sync_run_id, company_id, total_ap, overdue_ap, total_ar, overdue_ar,
+      cash_balance, working_capital, current_ratio
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+    [
+      syncRunId,
+      companyId,
+      round2(kpis.totalUnpaid || 0),
+      round2(kpis.overdueAmount || 0),
+      round2(services.arData?.metrics?.totalAR || 0),
+      round2(services.arData?.metrics?.overdueAR || 0),
+      round2(services.bankData?.metrics?.availableCash || 0),
+      services.statementData?.metrics?.workingCapital ?? null,
+      services.statementData?.metrics?.currentRatio ?? null,
+    ]
+  );
+}
+
+async function saveBillFacts({ syncRunId, companyId, bills }) {
+  for (const bill of bills) {
+    await pool.query(
+      `INSERT INTO qb_bill_facts (
+        sync_run_id, company_id, bill_id, vendor_name, bill_no,
+        bill_date, due_date, balance, total_amount,
+        priority_score, recommended_action, risk_level, decision_reason
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      [
+        syncRunId,
+        companyId,
+        bill.billId,
+        bill.vendorName || null,
+        bill.billNo || null,
+        bill.billDate || null,
+        bill.dueDate || null,
+        round2(bill.balance || 0),
+        round2(bill.originalAmount || 0),
+        bill.priorityScore ?? null,
+        bill.recommendedAction || null,
+        bill.riskLevel || null,
+        bill.decisionReason || null,
+      ]
+    );
+  }
+}
+
+async function saveInvoiceFacts({ syncRunId, companyId, invoices }) {
+  for (const invoice of invoices) {
+    await pool.query(
+      `INSERT INTO qb_invoice_facts (
+        sync_run_id, company_id, invoice_id, customer_name,
+        balance, total_amount, due_date, is_overdue
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [
+        syncRunId,
+        companyId,
+        invoice.invoiceId,
+        invoice.customerName || null,
+        round2(invoice.balance || 0),
+        round2(invoice.totalAmount || 0),
+        invoice.dueDate || null,
+        !!invoice.isOverdue,
+      ]
+    );
+  }
+}
+
+async function saveAccountFacts({ syncRunId, companyId, accounts }) {
+  for (const account of accounts) {
+    await pool.query(
+      `INSERT INTO qb_account_facts (
+        sync_run_id, company_id, account_name, account_type, balance
+      )
+      VALUES ($1,$2,$3,$4,$5)`,
+      [
+        syncRunId,
+        companyId,
+        account.Name || null,
+        account.AccountType || null,
+        round2(Number(account.CurrentBalance || account.CurrentBalanceWithSubAccounts || 0)),
+      ]
+    );
+  }
+}
+
+async function saveAiSummaryRecord({ syncRunId, companyId, summaryText }) {
+  await pool.query(
+    `INSERT INTO company_ai_summaries (sync_run_id, company_id, summary_text)
+     VALUES ($1, $2, $3)`,
+    [syncRunId, companyId, summaryText]
+  );
+}
+
+async function persistCompanyMemory({
+  companyId,
+  companyName,
+  realmId,
+  industry,
+  unpaidBills,
+  kpis,
+  services,
+  aiSummary,
+}) {
+  await ensureCompany({
+    companyId,
+    companyName,
+    realmId,
+    industry,
+  });
+
+  const syncRunId = await createSyncRun({
+    companyId,
+  });
+
+  await saveKpiSnapshot({
+    syncRunId,
+    companyId,
+    kpis,
+    services,
+  });
+
+  await saveBillFacts({
+    syncRunId,
+    companyId,
+    bills: unpaidBills,
+  });
+
+  await saveInvoiceFacts({
+    syncRunId,
+    companyId,
+    invoices: services.arData?.openInvoices || [],
+  });
+
+  const rawAccounts = await getAccountsFromQuickBooks();
+  await saveAccountFacts({
+    syncRunId,
+    companyId,
+    accounts: rawAccounts,
+  });
+
+  if (aiSummary) {
+    await saveAiSummaryRecord({
+      syncRunId,
+      companyId,
+      summaryText: aiSummary,
+    });
+  }
+
+  return syncRunId;
 }
 
 async function loadConnection(companyId = 'client-1') {
@@ -2004,6 +2278,26 @@ app.get('/bills', async (req, res) => {
       services.inventoryData
     );
 
+    // 👇 ADD THIS
+const aiSummary = await generateAiSummary({
+  unpaidBills,
+  kpis,
+  actionCounts,
+  alerts,
+  services,
+});
+
+await persistCompanyMemory({
+  companyId: 'client-1',
+  companyName: 'Ozarks Mountain Glass',
+  realmId,
+  industry: 'glass_installation',
+  unpaidBills,
+  kpis,
+  services,
+  aiSummary,
+});
+
 const dashboardData = { unpaidBills, kpis, actionCounts, dataQualityCounts };
 const readiness = buildReadinessChecklist(services, dashboardData);
 const blueprint = buildOzarkBlueprintPayload(services, dashboardData, alerts);
@@ -2197,6 +2491,59 @@ const currentSnapshot = buildHistoricalSnapshot(unpaidBills, kpis, actionCounts,
               text-decoration: none;
               border-radius: 6px;
             }
+              /* ===== CLEAN DASHBOARD UPGRADE ===== */
+
+.section-card {
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 14px;
+  padding: 20px;
+  margin-bottom: 20px;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.04);
+}
+
+.section-card h2 {
+  margin-bottom: 16px;
+  font-size: 20px;
+}
+
+.mini-grid,
+.blueprint-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 16px;
+}
+
+.mini-card {
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  padding: 14px;
+}
+
+.mini-card h3 {
+  margin-bottom: 10px;
+  font-size: 16px;
+}
+
+.mini-card p {
+  margin: 6px 0;
+}
+
+.ok {
+  color: #15803d;
+  font-weight: 700;
+}
+
+.bad {
+  color: #b91c1c;
+  font-weight: 700;
+}
+
+.muted {
+  color: #6b7280;
+  font-size: 13px;
+}
           </style>
         </head>
         <body>
@@ -2558,14 +2905,14 @@ function buildOzarkBlueprintPayload(services, dashboardData, alerts) {
     generatedAt: new Date().toISOString(),
 
     financialView: {
-      totalAP: dashboardData?.kpis?.totalUnpaid || 0,
-      overdueAP: dashboardData?.kpis?.overdueAmount || 0,
-      totalAR: services?.arData?.metrics?.totalAR || 0,
-      overdueAR: services?.arData?.metrics?.overdueAR || 0,
-      cash: services?.bankData?.metrics?.availableCash || 0,
-      workingCapital: services?.statementData?.metrics?.workingCapital || 0,
-      currentRatio: services?.statementData?.metrics?.currentRatio || null,
-    },
+  apOutstanding: dashboardData?.kpis?.totalUnpaid || 0,
+  overdueAP: dashboardData?.kpis?.overdueAmount || 0,
+  arOutstanding: services?.arData?.metrics?.totalAR || 0,
+  overdueAR: services?.arData?.metrics?.overdueAR || 0,
+  cash: services?.bankData?.metrics?.availableCash || 0,
+  workingCapital: services?.statementData?.metrics?.workingCapital || 0,
+  currentRatio: services?.statementData?.metrics?.currentRatio ?? null,
+},
 
     operationsView: {
       materialSuppliesOutstanding: materialsExposure,
