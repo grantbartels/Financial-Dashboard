@@ -499,11 +499,6 @@ const CONFIG = {
     mediumCashCoverage: 8,
     abnormalAmount: 12,
   },
-
-  defaults: {
-  terms: 'Net 30',
-  uncategorizedLabel: 'Uncategorized',
-},
   actionCutoffs: {
     payNowMin: 75,
     paySoonMin: 40,
@@ -906,8 +901,7 @@ function buildOpenInvoices(rawInvoices = []) {
     .map(normalizeQuickBooksInvoice)
     .filter((invoice) => Number(invoice.Balance || 0) > 0)
     .map((invoice) => {
-     const timeDiffs = getTimeDiffs(invoice.DueDate);
-const daysUntilDue = timeDiffs.daysUntilDue;
+      const daysUntilDue = getDaysUntilDue(invoice.DueDate);
       return {
         invoiceId: safeText(invoice.Id),
         customerName: safeText(invoice.CustomerRef?.name, 'Unknown Customer'),
@@ -1294,56 +1288,11 @@ function getLocationClass(bill) {
 }
 
 function getMemo(bill) {
-  const value = bill.PrivateNote || bill.Memo || null;
-  return value && String(value).trim() ? String(value).trim() : null;
+  return safeText(bill.PrivateNote || bill.Memo);
 }
 
 function getTerms(bill) {
-  const value = bill.SalesTermRef?.name || bill.TermRef?.name || null;
-  return value && String(value).trim() ? String(value).trim() : null;
-}
-
-function buildAutoMemo({ vendorName, categorySummary, account }) {
-  const vendor = !isMissingText(vendorName) ? vendorName : 'Unknown Vendor';
-  const category =
-    !isMissingText(categorySummary) && categorySummary !== 'N/A'
-      ? categorySummary
-      : !isMissingText(account) && account !== 'N/A'
-        ? account
-        : CONFIG.defaults.uncategorizedLabel;
-
-  return `${vendor} - ${category}`;
-}
-
-function applyBillDataQualityDefaults(baseBill) {
-  const wasMissingInvoiceNumber = isMissingText(baseBill.billNo);
-  const wasMissingTerms = isMissingText(baseBill.terms);
-  const wasMissingMemo = isMissingText(baseBill.memo);
-
-  return {
-    ...baseBill,
-    rawBillNo: baseBill.billNo,
-    rawTerms: baseBill.terms,
-    rawMemo: baseBill.memo,
-
-    billNo: baseBill.billNo || null,
-
-    terms: wasMissingTerms
-      ? CONFIG.defaults.terms
-      : baseBill.terms,
-
-    memo: wasMissingMemo
-      ? buildAutoMemo({
-          vendorName: baseBill.vendorName,
-          categorySummary: baseBill.categorySummary,
-          account: baseBill.account,
-        })
-      : baseBill.memo,
-
-    wasMissingInvoiceNumber,
-    wasMissingTerms,
-    wasMissingMemo,
-  };
+  return safeText(bill.SalesTermRef?.name || bill.TermRef?.name);
 }
 
 // ======================================================
@@ -1392,27 +1341,10 @@ function normalizeQuickBooksBills(rawBills = []) {
   return rawBills.map(normalizeQuickBooksBill);
 }
 
-function getTimeDiffs(dueDate) {
-  if (!dueDate) return {};
-
-  const now = new Date();
-  const due = new Date(dueDate);
-  const diffMs = due - now;
-
-  return {
-    hoursUntilDue: Math.floor(diffMs / (1000 * 60 * 60)),
-    daysUntilDue: Math.floor(diffMs / (1000 * 60 * 60 * 24)),
-    weeksUntilDue: Math.floor(diffMs / (1000 * 60 * 60 * 24 * 7)),
-    monthsUntilDue: Math.floor(diffMs / (1000 * 60 * 60 * 24 * 30)),
-  };
-}
-
 function buildBaseProcessedBills(rawBills) {
   return rawBills.map((bill) => {
     const billId = safeText(bill.Id);
-    const billNo = bill.DocNumber && String(bill.DocNumber).trim()
-  ? String(bill.DocNumber).trim()
-  : null;
+    const billNo = safeText(bill.DocNumber);
     const vendorId = safeText(bill.VendorRef?.value);
     const vendorName = safeText(bill.VendorRef?.name, 'Unknown Vendor');
     const billDate = safeText(bill.TxnDate);
@@ -1429,8 +1361,7 @@ function buildBaseProcessedBills(rawBills) {
     const categorySummary = getCategorySummary(bill.Line);
     const account = getPrimaryAccount(bill.Line);
     const locationClass = getLocationClass(bill);
-    const timeDiffs = getTimeDiffs(dueDate);
-const daysUntilDue = timeDiffs.daysUntilDue;
+    const daysUntilDue = getDaysUntilDue(dueDate);
     const isOverdue = daysUntilDue !== null && daysUntilDue < 0;
     const agingBucket = getAgingBucket(daysUntilDue);
     const amountBucket = getAmountBucket(originalAmount);
@@ -1442,40 +1373,35 @@ const daysUntilDue = timeDiffs.daysUntilDue;
     });
     const isCriticalVendor = isCriticalVendorCategory(vendorCategory);
 
-    const baseBill = {
-  billId,
-  billNo,
-  vendorId,
-  vendorName,
-  vendorCategory,
-  isCriticalVendor,
-  billDate,
-  dueDate,
-  createdAt,
-  lastUpdated,
-  originalAmount,
-  balance,
-  amountPaid,
-  currency,
-  paymentStatus: getPaymentStatus(balance, originalAmount),
-  terms,
-  memo,
-  categorySummary,
-  account,
-  locationClass,
-daysUntilDue,
-hoursUntilDue: timeDiffs.hoursUntilDue,
-weeksUntilDue: timeDiffs.weeksUntilDue,
-monthsUntilDue: timeDiffs.monthsUntilDue,
-isOverdue,
-agingBucket,
-amountBucket,
-  dueIn3Days: daysUntilDue !== null && daysUntilDue >= 0 && daysUntilDue <= CONFIG.thresholds.dueSoonDays,
-  dueIn7Days: daysUntilDue !== null && daysUntilDue >= 0 && daysUntilDue <= CONFIG.thresholds.dueWeekDays,
-  dueIn14Days: daysUntilDue !== null && daysUntilDue >= 0 && daysUntilDue <= CONFIG.thresholds.due14Days,
-};
-
-return applyBillDataQualityDefaults(baseBill);
+    return {
+      billId,
+      billNo,
+      vendorId,
+      vendorName,
+      vendorCategory,
+      isCriticalVendor,
+      billDate,
+      dueDate,
+      createdAt,
+      lastUpdated,
+      originalAmount,
+      balance,
+      amountPaid,
+      currency,
+      paymentStatus: getPaymentStatus(balance, originalAmount),
+      terms,
+      memo,
+      categorySummary,
+      account,
+      locationClass,
+      daysUntilDue,
+      isOverdue,
+      agingBucket,
+      amountBucket,
+      dueIn3Days: daysUntilDue !== null && daysUntilDue >= 0 && daysUntilDue <= CONFIG.thresholds.dueSoonDays,
+      dueIn7Days: daysUntilDue !== null && daysUntilDue >= 0 && daysUntilDue <= CONFIG.thresholds.dueWeekDays,
+      dueIn14Days: daysUntilDue !== null && daysUntilDue >= 0 && daysUntilDue <= CONFIG.thresholds.due14Days,
+    };
   });
 }
 
@@ -1596,21 +1522,21 @@ function applyRulesToBill(bill, context) {
     addScore(CONFIG.weights.criticalVendor, `Critical vendor category: ${bill.vendorCategory}`);
   }
 
- if (bill.wasMissingInvoiceNumber) {
-  addScore(CONFIG.weights.missingBillNo, 'Missing invoice number', 'data');
-}
+  if (isMissingText(bill.billNo)) {
+    addScore(CONFIG.weights.missingBillNo, 'Missing invoice number', 'data');
+  }
 
-if (!bill.dueDate) {
-  addScore(CONFIG.weights.missingDueDate, 'Missing due date', 'data');
-}
+  if (!bill.dueDate) {
+    addScore(CONFIG.weights.missingDueDate, 'Missing due date', 'data');
+  }
 
-if (bill.wasMissingMemo) {
-  addScore(CONFIG.weights.missingMemo, 'Missing memo', 'data');
-}
+  if (isMissingText(bill.memo)) {
+    addScore(CONFIG.weights.missingMemo, 'Missing memo', 'data');
+  }
 
-if (bill.wasMissingTerms) {
-  addScore(CONFIG.weights.missingTerms, 'Missing terms', 'data');
-}
+  if (isMissingText(bill.terms)) {
+    addScore(CONFIG.weights.missingTerms, 'Missing terms', 'data');
+  }
 
   if (duplicateWarnings.length) {
     addScore(CONFIG.weights.duplicateSuspected, 'Possible duplicate detected', 'anomaly');
@@ -2054,9 +1980,6 @@ function renderAlerts(alerts) {
 function buildDashboardData(rawBills, services) {
   const decisionBills = buildDecisionBills(rawBills, services);
   const unpaidBills = sortBillsForDecision(decisionBills.filter((bill) => bill.balance > 0));
-
-console.log('TEST BILL:', unpaidBills[0]);
-
   const kpis = buildKpiSummary(unpaidBills);
   const actionCounts = buildActionCounts(unpaidBills);
   const dataQualityCounts = buildDataQualityCounts(unpaidBills);
