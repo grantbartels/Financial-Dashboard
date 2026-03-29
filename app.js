@@ -2236,31 +2236,6 @@ function getSystemStageLabel() {
 
 
 
-    console.log('Running daily automated snapshot...');
-
-    const rawBills = await getBillsFromQuickBooks(true);
-    const services = await buildAllServices(rawBills);
-    const { unpaidBills, kpis, actionCounts } = buildDashboardData(rawBills, services);
-
-    const currentSnapshot = buildHistoricalSnapshot(unpaidBills, kpis, actionCounts, services.arData?.metrics);
-
-    await saveSnapshot({
-      companyId: 'client-1',
-      totalAP: kpis.totalUnpaid,
-      overdueAP: kpis.overdueAmount,
-      totalAR: services.arData?.metrics?.totalAR || 0,
-      overdueAR: services.arData?.metrics?.overdueAR || 0,
-      cash: services.bankData?.metrics?.availableCash || 0,
-    });
-
-    recordDashboardSnapshot(currentSnapshot);
-
-    console.log('Daily automated snapshot complete');
-  } catch (err) {
-    console.error('Daily automation failed:', err.message);
-  }
-}
-
 // ======================================================
 // OAUTH ROUTES
 // ======================================================
