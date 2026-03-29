@@ -31,14 +31,34 @@ async function initDB() {
       total_ar NUMERIC,
       overdue_ar NUMERIC DEFAULT 0,
       cash_balance NUMERIC,
+      overdue_bills_count INTEGER DEFAULT 0,
+      pay_now_count INTEGER DEFAULT 0,
+      review_count INTEGER DEFAULT 0,
+      unpaid_bills_count INTEGER DEFAULT 0,
       hash_key TEXT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP );
   `);
+
+
 
 await pool.query(`
   ALTER TABLE dashboard_snapshots
-  ADD COLUMN IF NOT EXISTS overdue_ar NUMERIC DEFAULT 0;
+  ADD COLUMN IF NOT EXISTS overdue_bills_count INTEGER DEFAULT 0;
+`);
+
+await pool.query(`
+  ALTER TABLE dashboard_snapshots
+  ADD COLUMN IF NOT EXISTS pay_now_count INTEGER DEFAULT 0;
+`);
+
+await pool.query(`
+  ALTER TABLE dashboard_snapshots
+  ADD COLUMN IF NOT EXISTS review_count INTEGER DEFAULT 0;
+`);
+
+await pool.query(`
+  ALTER TABLE dashboard_snapshots
+  ADD COLUMN IF NOT EXISTS unpaid_bills_count INTEGER DEFAULT 0;
 `);
 
   await pool.query(`
@@ -153,6 +173,10 @@ async function saveSnapshot(data) {
       totalAR: round2(data.totalAR || 0),
       overdueAR: round2(data.overdueAR || 0),
       cash: round2(data.cash || 0),
+      overdueBillsCount: Number(data.overdueBillsCount || 0),
+      payNowCount: Number(data.payNowCount || 0),
+      reviewCount: Number(data.reviewCount || 0),
+      unpaidBillsCount: Number(data.unpaidBillsCount || 0),
     };
 
     const hashKey = crypto
@@ -175,8 +199,20 @@ async function saveSnapshot(data) {
 
     await pool.query(
       `INSERT INTO dashboard_snapshots
-      (company_id, total_ap, overdue_ap, total_ar, overdue_ar, cash_balance, hash_key)
-      VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      (
+        company_id,
+        total_ap,
+        overdue_ap,
+        total_ar,
+        overdue_ar,
+        cash_balance,
+        overdue_bills_count,
+        pay_now_count,
+        review_count,
+        unpaid_bills_count,
+        hash_key
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
       [
         payload.companyId,
         payload.totalAP,
@@ -184,6 +220,10 @@ async function saveSnapshot(data) {
         payload.totalAR,
         payload.overdueAR,
         payload.cash,
+        payload.overdueBillsCount,
+        payload.payNowCount,
+        payload.reviewCount,
+        payload.unpaidBillsCount,
         hashKey,
       ]
     );
@@ -194,22 +234,46 @@ async function saveSnapshot(data) {
   }
 }
 
-async function getHistoricalComparisonsFromDb(companyId) {
-  const result = await pool.query(
-    `SELECT
+async function getHistoricalComparisonsFromDb(companyId, startDate = null, endDate = null) {
+  let query = `
+    SELECT
       company_id,
       total_ap,
       overdue_ap,
       total_ar,
       overdue_ar,
       cash_balance,
+      overdue_bills_count,
+      pay_now_count,
+      review_count,
+      unpaid_bills_count,
       created_at
-     FROM dashboard_snapshots
-     WHERE company_id = $1
-     ORDER BY created_at DESC
-     LIMIT 2`,
-    [companyId]
-  );
+    FROM dashboard_snapshots
+    WHERE company_id = $1
+  `;
+
+  const values = [companyId];
+
+  if (startDate && endDate) {
+    query += `
+      AND created_at >= $2::date
+      AND created_at < ($3::date + INTERVAL '1 day')
+    `;
+    values.push(startDate, endDate);
+  } else if (startDate) {
+    query += `
+      AND created_at >= $2::date
+      AND created_at < ($2::date + INTERVAL '1 day')
+    `;
+    values.push(startDate);
+  }
+
+  query += `
+    ORDER BY created_at DESC
+    LIMIT 2
+  `;
+
+  const result = await pool.query(query, values);
 
   if (result.rows.length < 2) return null;
 
@@ -219,32 +283,64 @@ async function getHistoricalComparisonsFromDb(companyId) {
   return {
     totalUnpaid: buildTrend(Number(current.total_ap || 0), Number(previous.total_ap || 0)),
     overdueAmount: buildTrend(Number(current.overdue_ap || 0), Number(previous.overdue_ap || 0)),
-    overdueBillsCount: null,
+    overdueBillsCount: buildTrend(
+      Number(current.overdue_bills_count || 0),
+      Number(previous.overdue_bills_count || 0)
+    ),
     totalAR: buildTrend(Number(current.total_ar || 0), Number(previous.total_ar || 0)),
     overdueAR: buildTrend(Number(current.overdue_ar || 0), Number(previous.overdue_ar || 0)),
-    payNowCount: null,
-    reviewCount: null,
-    unpaidBillsCount: null,
+    payNowCount: buildTrend(
+      Number(current.pay_now_count || 0),
+      Number(previous.pay_now_count || 0)
+    ),
+    reviewCount: buildTrend(
+      Number(current.review_count || 0),
+      Number(previous.review_count || 0)
+    ),
+    unpaidBillsCount: buildTrend(
+      Number(current.unpaid_bills_count || 0),
+      Number(previous.unpaid_bills_count || 0)
+    ),
   };
 }
 
-async function getSnapshotHistory(companyId, days = 30) {
-  const result = await pool.query(
-    `SELECT
+async function getSnapshotHistory(companyId, startDate = null, endDate = null) {
+  let query = `
+    SELECT
       company_id,
       total_ap,
       overdue_ap,
       total_ar,
       overdue_ar,
       cash_balance,
+      overdue_bills_count,
+      pay_now_count,
+      review_count,
+      unpaid_bills_count,
       created_at
-     FROM dashboard_snapshots
-     WHERE company_id = $1
-       AND created_at >= NOW() - ($2 || ' days')::INTERVAL
-     ORDER BY created_at ASC`,
-    [companyId, String(days)]
-  );
+    FROM dashboard_snapshots
+    WHERE company_id = $1
+  `;
 
+  const values = [companyId];
+
+  if (startDate && endDate) {
+    query += `
+      AND created_at >= $2::date
+      AND created_at < ($3::date + INTERVAL '1 day')
+    `;
+    values.push(startDate, endDate);
+  } else if (startDate) {
+    query += `
+      AND created_at >= $2::date
+      AND created_at < ($2::date + INTERVAL '1 day')
+    `;
+    values.push(startDate);
+  }
+
+  query += ` ORDER BY created_at ASC`;
+
+  const result = await pool.query(query, values);
   return result.rows;
 }
 
@@ -452,15 +548,20 @@ async function persistCompanyMemory({
       summaryText: aiSummary,
     });
   }
+const actionCounts = buildActionCounts(unpaidBills);
+
 await saveSnapshot({
   companyId,
   totalAP: kpis.totalUnpaid,
   overdueAP: kpis.overdueAmount,
-  totalAR: services.arData?.metrics?.totalAR,
-  overdueAR: services.arData?.metrics?.overdueAR,
-  cash: services.bankData?.metrics?.availableCash
+  totalAR: services.arData?.metrics?.totalAR || 0,
+  overdueAR: services.arData?.metrics?.overdueAR || 0,
+  cash: services.bankData?.metrics?.availableCash || 0,
+  overdueBillsCount: kpis.overdueBillsCount || 0,
+  payNowCount: actionCounts.payNow || 0,
+  reviewCount: actionCounts.review || 0,
+  unpaidBillsCount: unpaidBills.length || 0,
 });
-  return syncRunId;
 }
 
 async function loadConnection(companyId = 'client-1') {
@@ -2411,6 +2512,23 @@ app.get('/callback', async (req, res) => {
 // DASHBOARD
 // ======================================================
 
+const dateFilterHtml = `
+  <form method="GET" action="/bills" style="margin: 16px 0; display: flex; gap: 10px; align-items: end; flex-wrap: wrap;">
+    <div>
+      <label for="startDate"><strong>Start Date</strong></label><br>
+      <input type="date" id="startDate" name="startDate" value="${escapeHtml(startDate || '')}">
+    </div>
+
+    <div>
+      <label for="endDate"><strong>End Date</strong></label><br>
+      <input type="date" id="endDate" name="endDate" value="${escapeHtml(endDate || '')}">
+    </div>
+
+    <button type="submit" class="button">Apply Dates</button>
+    <a class="button" href="/bills">Clear</a>
+  </form>
+`;
+
 app.get('/bills', async (req, res) => {
   try {
     if (!accessToken || !realmId) {
@@ -2522,16 +2640,32 @@ const blueprintHtml = `
 
 
     await saveSnapshot({
-      companyId: 'client-1',
-      totalAP: kpis.totalUnpaid,
-      overdueAP: kpis.overdueAmount,
-      totalAR: services.arData?.metrics?.totalAR || 0,
-      overdueAR: services.arData?.metrics?.overdueAR || 0,
-      cash: services.bankData?.metrics?.availableCash || 0,
-    });
+  companyId: 'client-1',
+  totalAP: kpis.totalUnpaid,
+  overdueAP: kpis.overdueAmount,
+  totalAR: services.arData?.metrics?.totalAR || 0,
+  overdueAR: services.arData?.metrics?.overdueAR || 0,
+  cash: services.bankData?.metrics?.availableCash || 0,
+  overdueBillsCount: kpis.overdueBillsCount || 0,
+  payNowCount: actionCounts.payNow || 0,
+  reviewCount: actionCounts.review || 0,
+  unpaidBillsCount: unpaidBills.length || 0,
+});
 
-const historicalComparisons = await getHistoricalComparisonsFromDb('client-1');
-const snapshotHistory = await getSnapshotHistory('client-1', 30);
+const startDate = req.query.startDate || null;
+const endDate = req.query.endDate || null;
+
+const historicalComparisons = await getHistoricalComparisonsFromDb(
+  'client-1',
+  startDate,
+  endDate
+);
+
+const snapshotHistory = await getSnapshotHistory(
+  'client-1',
+  startDate,
+  endDate
+);
 
     const rows = unpaidBills.map((bill) => {
       let rowClass = '';
@@ -2920,9 +3054,10 @@ ${blueprintHtml}
               </tbody>
             </table>
           </div>
-          <a class="button" href="/bills?refresh=true">Refresh Data</a>
-          <a class="button" href="/bills/download">Download CSV</a>
-          <a class="button" href="/">Back Home</a>
+         ${dateFilterHtml}
+        <a class="button" href="/bills?refresh=true&startDate=${encodeURIComponent(startDate || '')}&endDate=${encodeURIComponent(endDate || '')}">Refresh Data</a>
+        <a class="button" href="/bills?refresh=true&ai=true&startDate=${encodeURIComponent(startDate || '')}&endDate=${encodeURIComponent(endDate || '')}">Refresh + Generate AI Summary</a>
+      <a class="button" href="/">Back Home</a>
         </body>
       </html>
     `);
