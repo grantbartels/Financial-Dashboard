@@ -189,6 +189,60 @@ async function saveSnapshot(data) {
   }
 }
 
+async function getHistoricalComparisonsFromDb(companyId) {
+  const result = await pool.query(
+    `SELECT
+      company_id,
+      total_ap,
+      overdue_ap,
+      total_ar,
+      overdue_ar,
+      cash_balance,
+      created_at
+     FROM dashboard_snapshots
+     WHERE company_id = $1
+     ORDER BY created_at DESC
+     LIMIT 2`,
+    [companyId]
+  );
+
+  if (result.rows.length < 2) return null;
+
+  const current = result.rows[0];
+  const previous = result.rows[1];
+
+  return {
+    totalUnpaid: buildTrend(Number(current.total_ap || 0), Number(previous.total_ap || 0)),
+    overdueAmount: buildTrend(Number(current.overdue_ap || 0), Number(previous.overdue_ap || 0)),
+    overdueBillsCount: null,
+    totalAR: buildTrend(Number(current.total_ar || 0), Number(previous.total_ar || 0)),
+    overdueAR: buildTrend(Number(current.overdue_ar || 0), Number(previous.overdue_ar || 0)),
+    payNowCount: null,
+    reviewCount: null,
+    unpaidBillsCount: null,
+  };
+}
+
+async function getSnapshotHistory(companyId, days = 30) {
+  const result = await pool.query(
+    `SELECT
+      company_id,
+      total_ap,
+      overdue_ap,
+      total_ar,
+      overdue_ar,
+      cash_balance,
+      created_at
+     FROM dashboard_snapshots
+     WHERE company_id = $1
+       AND created_at >= NOW() - ($2 || ' days')::INTERVAL
+     ORDER BY created_at ASC`,
+    [companyId, String(days)]
+  );
+
+  return result.rows;
+}
+
 async function saveConnection(data) {
   await pool.query(
     `INSERT INTO qb_connections
@@ -2067,6 +2121,7 @@ function buildDashboardData(rawBills, services) {
   return { unpaidBills, kpis, actionCounts, dataQualityCounts };
 }
 
+
 async function buildAllServices(rawBills) {
   const [billPayments, statementDataRaw, bankDataRaw, arData, inventoryData] = await Promise.all([
     getBillPaymentsFromQuickBooks(),
@@ -2460,7 +2515,6 @@ const blueprintHtml = `
   </div>
 `;
 
-const currentSnapshot = buildHistoricalSnapshot(unpaidBills, kpis, actionCounts, services.arData?.metrics);
 
     await saveSnapshot({
       companyId: 'client-1',
@@ -2471,11 +2525,8 @@ const currentSnapshot = buildHistoricalSnapshot(unpaidBills, kpis, actionCounts,
       cash: services.bankData?.metrics?.availableCash || 0,
     });
 
-    recordDashboardSnapshot(currentSnapshot);
-
-    const previousSnapshot = getPreviousSnapshot();
-    const historicalComparisons =
-      buildHistoricalComparisons(currentSnapshot, previousSnapshot);
+const historicalComparisons = await getHistoricalComparisonsFromDb('client-1');
+const snapshotHistory = await getSnapshotHistory('client-1', 30);
 
     const rows = unpaidBills.map((bill) => {
       let rowClass = '';
@@ -3355,8 +3406,6 @@ async function runAutomatedSnapshot() {
       services.arData?.metrics || null
     );
 
-    recordDashboardSnapshot(snapshot);
-
     await saveSnapshot({
       companyId: 'client-1',
       totalAP: kpis.totalUnpaid,
@@ -3365,6 +3414,8 @@ async function runAutomatedSnapshot() {
       overdueAR: services.arData?.metrics?.overdueAR || 0,
       cash: services.bankData?.metrics?.availableCash || 0,
     });
+
+
 
     console.log('Snapshot saved');
   } catch (err) {
