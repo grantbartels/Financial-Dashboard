@@ -2111,7 +2111,6 @@ const billSample = unpaidBills.slice(0, 25).map((bill) => ({
   liquidity: services.bankData?.metrics || null,
   paymentBehavior: services.paymentData?.metrics || null
 };
-    };
 
     const prompt = `
 You are a finance operations assistant for a small business dashboard.
