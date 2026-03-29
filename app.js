@@ -2512,39 +2512,27 @@ app.get('/callback', async (req, res) => {
 // DASHBOARD
 // ======================================================
 
-const dateFilterHtml = `
-  <form method="GET" action="/bills" style="margin: 16px 0; display: flex; gap: 10px; align-items: end; flex-wrap: wrap;">
-    <div>
-      <label for="startDate"><strong>Start Date</strong></label><br>
-      <input type="date" id="startDate" name="startDate" value="${escapeHtml(startDate || '')}">
-    </div>
-
-    <div>
-      <label for="endDate"><strong>End Date</strong></label><br>
-      <input type="date" id="endDate" name="endDate" value="${escapeHtml(endDate || '')}">
-    </div>
-
-    <button type="submit" class="button">Apply Dates</button>
-    <a class="button" href="/bills">Clear</a>
-  </form>
-`;
-
 app.get('/bills', async (req, res) => {
   try {
-    if (!accessToken || !realmId) {
-      return res.send(`
-        <html>
-          <body style="font-family: Arial, sans-serif; padding: 30px;">
-            <h1>Not connected</h1>
-            <p>Please connect QuickBooks first.</p>
-            <a href="/">Go Home</a>
-          </body>
-        </html>
-      `);
-    }
+    const startDate = req.query.startDate || '';
+    const endDate = req.query.endDate || '';
 
+    const dateFilterHtml = `
+      <form method="GET" action="/bills" style="margin: 16px 0; display: flex; gap: 10px; align-items: end; flex-wrap: wrap;">
+        <div>
+          <label for="startDate"><strong>Start Date</strong></label><br>
+          <input type="date" id="startDate" name="startDate" value="${escapeHtml(startDate)}">
+        </div>
 
+        <div>
+          <label for="endDate"><strong>End Date</strong></label><br>
+          <input type="date" id="endDate" name="endDate" value="${escapeHtml(endDate)}">
+        </div>
 
+        <button type="submit" class="button">Apply Dates</button>
+        <a class="button" href="/bills">Clear</a>
+      </form>
+    `;
 
     const forceRefresh = req.query.refresh === 'true';
     const rawBills = await getBillsFromQuickBooks(forceRefresh);
