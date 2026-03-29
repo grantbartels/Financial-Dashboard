@@ -2369,20 +2369,6 @@ const currentSnapshot = buildHistoricalSnapshot(unpaidBills, kpis, actionCounts,
     const historicalComparisons =
       buildHistoricalComparisons(currentSnapshot, previousSnapshot);
 
-    const runAI = req.query.ai === 'true';
-
-    let aiSummary = 'AI summary not generated yet. Click "Generate AI Summary" to run it.';
-
-    if (runAI) {
-      aiSummary = await generateAiSummary({
-        unpaidBills,
-        kpis,
-        actionCounts,
-        alerts,
-        services,
-      });
-    }
-
     const rows = unpaidBills.map((bill) => {
       let rowClass = '';
       if (bill.recommendedAction === 'Pay Now') rowClass = 'pay-now';
